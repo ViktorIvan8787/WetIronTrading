@@ -1,0 +1,13 @@
+[package]
+name = "wetiron"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+sysinfo = "0.33"
+notify-rust = "4"
+chrono = "0.4"
