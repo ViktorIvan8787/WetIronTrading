@@ -2,6 +2,8 @@
 name = "wetiron"
 version = "0.1.0"
 edition = "2024"
+license-file = "LICENSE"
+publish = false
 
 [dependencies]
 ratatui = "0.29"
