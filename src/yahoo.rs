@@ -59,6 +59,32 @@ impl Yahoo {
         Ok((candles, session(&r["meta"])))
     }
 
+    /// Last ~5 fiscal quarters of company accounts (no login needed). Empty for non-companies.
+    pub fn fundamentals(&self, sym: &str) -> Result<Vec<crate::quant::FundQ>, String> {
+        let now = chrono::Utc::now().timestamp();
+        let types = "quarterlyDilutedEPS,quarterlyStockholdersEquity,quarterlyNetIncome,quarterlyDilutedAverageShares";
+        let url = format!("{BASE}/ws/fundamentals-timeseries/v1/finance/timeseries/{}?type={types}&period1={}&period2={}", enc(sym), now - 4 * 365 * 86_400, now + 86_400);
+        let v = self.json(&url)?;
+        let res = v["timeseries"]["result"].as_array().ok_or_else(|| err(&v["timeseries"]))?;
+        let mut q: std::collections::BTreeMap<i64, crate::quant::FundQ> = Default::default();
+        for r in res {
+            let Some(k) = r["meta"]["type"][0].as_str() else { continue };
+            for x in r[k].as_array().into_iter().flatten() {
+                let (Some(d), Some(val)) = (x["asOfDate"].as_str(), x["reportedValue"]["raw"].as_f64()) else { continue };
+                let Ok(d) = chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d") else { continue };
+                let t = d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+                let e = q.entry(t).or_insert(crate::quant::FundQ { end_t: t, eps: f64::NAN, equity: f64::NAN, net_income: f64::NAN, shares: f64::NAN });
+                match k {
+                    "quarterlyDilutedEPS" => e.eps = val,
+                    "quarterlyStockholdersEquity" => e.equity = val,
+                    "quarterlyNetIncome" => e.net_income = val,
+                    _ => e.shares = val,
+                }
+            }
+        }
+        Ok(q.into_values().collect())
+    }
+
     /// Every US-listed symbol from Nasdaq's public symbol directory, Yahoo-style tickers.
     pub fn symbol_list(&self) -> Result<Vec<String>, String> {
         let mut out = vec![];

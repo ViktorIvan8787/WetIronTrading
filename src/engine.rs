@@ -21,10 +21,12 @@ pub struct State {
     pub last_ok_ms: i64,
     pub healthy: bool,
     pub symbols: Arc<Vec<String>>,
-    pub predictions: HashMap<String, Prediction>,
-    pub board: HashMap<(String, String), Prediction>, // (model, symbol)
+    pub predictions: HashMap<(bool, String), Prediction>, // one-stock panel by (MATH desk?, symbol)
+    pub board: crate::paper::Preds, // (model, timeframe, horizon, symbol)
+    pub book: Vec<Strategy>,         // paper strategies
     pub track: Vec<TrackScore>,
     pub ai_status: String,
+    pub math_status: String,
     pub clients: usize,
     pub version: u64, // bumped on every change so clients only resend when needed
 }
@@ -59,6 +61,11 @@ impl State {
         if !order.contains(&&self.selected) {
             order.insert(0, &self.selected);
         }
+        for p in self.book.iter().flat_map(|b| &b.positions) {
+            if !order.contains(&&p.sym) {
+                order.push(&p.sym);
+            }
+        }
         Snapshot {
             source: self.settings.data_source.clone(),
             mode: self.settings.mode.clone(),
@@ -71,8 +78,11 @@ impl State {
             alert: self.alert.clone(),
             predictions: self.predictions.values().cloned().collect(),
             board: self.board.values().filter(|p| self.settings.watchlist.contains(&p.sym)).cloned().collect(),
+            // shortcut: whole book (incl. history) in every snapshot; send deltas if it gets slow
+            strategies: self.book.clone(),
             track: self.track.clone(),
             ai_status: self.ai_status.clone(),
+            math_status: self.math_status.clone(),
             last_ok_ms: self.last_ok_ms,
             healthy: self.healthy,
         }
@@ -99,8 +109,10 @@ pub fn run() {
         symbols: Arc::new(vec![]),
         predictions: HashMap::new(),
         board: HashMap::new(),
+        book: crate::paper::load(),
         track: vec![],
         ai_status: "starting".into(),
+        math_status: "starting".into(),
         clients: 0,
         version: 0,
     }));
@@ -111,9 +123,14 @@ pub fn run() {
             s.log(w);
         }
     }
+    let track = Arc::new(Mutex::new(crate::ai::Track::load()));
+    for math in [false, true] {
+        let (st, track) = (st.clone(), track.clone());
+        thread::spawn(move || crate::ai::ai_loop(st, track, math));
+    }
     {
         let st = st.clone();
-        thread::spawn(move || crate::ai::ai_loop(st));
+        thread::spawn(move || paper_loop(st));
     }
     if source == "yahoo" {
         let st = st.clone();
@@ -190,6 +207,114 @@ fn handle(cmd: ToEngine, st: &Shared) {
             s.settings.ai = ai;
             s.version += 1;
         }
+        ToEngine::Math(m) => {
+            s.settings.math = m;
+            s.version += 1;
+        }
+        ToEngine::NewTest { group, a, b, tf, h } => {
+            if s.book.iter().any(|x| x.group == group) {
+                return;
+            }
+            let start = s.settings.start_cash_cents;
+            let kind = if is_math(&a) { "MATHS" } else { "AI" };
+            let tfn = TIMEFRAMES[tf.min(TIMEFRAMES.len() - 1)].2;
+            let (na, nb) = (model_label(&a), model_label(&b));
+            let new = [
+                crate::paper::new_strategy(group, group, format!("{na} + {nb} ({tfn} x{h})"), &format!("{kind} PAIR"), vec![a.clone(), b.clone()], tf, h, start),
+                crate::paper::new_strategy(group + 1, group, format!("{na} ({tfn} x{h})"), kind, vec![a], tf, h, start),
+                crate::paper::new_strategy(group + 2, group, format!("{nb} ({tfn} x{h})"), kind, vec![b], tf, h, start),
+            ];
+            s.book.extend(new);
+            s.log(format!("TEST started: {na} vs {nb}, {tfn} x{h}, {} paper each", crate::paper::fmt_cents(start)));
+            crate::paper::save(&s.book);
+        }
+        ToEngine::Buy { id, sym, cents } => order(&mut s, id, &sym, Some(cents), true),
+        ToEngine::Sell { id, sym, cents } => order(&mut s, id, &sym, cents, false),
+        ToEngine::End { id } => {
+            let State { book, quotes, .. } = &mut *s;
+            let Some(x) = book.iter_mut().find(|x| x.id == id && x.ended_ms == 0) else { return };
+            crate::paper::end(x, quotes, now_ms());
+            let msg = format!("TERMINATED {}: final value {}", x.name, crate::paper::fmt_cents(crate::paper::value(x, quotes)));
+            crate::paper::save(&s.book);
+            s.log(msg);
+        }
+        ToEngine::Delete { id } => {
+            s.book.retain(|x| x.id != id || x.ended_ms == 0); // only ended runs can be deleted
+            crate::paper::save(&s.book);
+            s.version += 1;
+        }
+        ToEngine::SetRisk { id, stop_pct, trail_pct, max_hold } => {
+            if let Some(x) = s.book.iter_mut().find(|x| x.id == id && x.ended_ms == 0) {
+                (x.stop_pct, x.trail_pct, x.max_hold) = (stop_pct, trail_pct, max_hold);
+                x.note = format!("RISK stop {stop_pct}% | trail {trail_pct}% | max hold {}", if max_hold { "ON" } else { "OFF" });
+            }
+            crate::paper::save(&s.book);
+            s.version += 1;
+        }
+        ToEngine::SetSize { id, vol_target } => {
+            if let Some(x) = s.book.iter_mut().find(|x| x.id == id && x.ended_ms == 0) {
+                x.vol_target = vol_target;
+                x.note = format!("SIZE {}", if vol_target { "VOL TARGET" } else { "EQUAL $" });
+            }
+            crate::paper::save(&s.book);
+            s.version += 1;
+        }
+        ToEngine::SetAuto { id, auto } => {
+            if let Some(x) = s.book.iter_mut().find(|x| x.id == id && x.ended_ms == 0) {
+                x.auto = auto;
+                x.note = format!("AUTO {auto:?}");
+            }
+            crate::paper::save(&s.book);
+            s.version += 1;
+        }
+    }
+}
+
+/// Manual buy/sell from a strategy window at the latest quote; refusals land in the strategy's note.
+fn order(s: &mut State, id: u64, sym: &str, cents: Option<i64>, buy: bool) {
+    let lim = crate::paper::Limits { max_pos_pct: s.settings.max_position_pct as i64, day_stop_pct: s.settings.daily_loss_stop_pct as i64 };
+    let price = s.quotes.get(sym).map_or(0, crate::paper::cents);
+    let State { book, quotes, board, .. } = s;
+    let Some(x) = book.iter_mut().find(|x| x.id == id) else { return };
+    if x.ended_ms > 0 {
+        x.note = "this run has ended - it can't trade".into();
+        s.version += 1;
+        return;
+    }
+    let v = crate::paper::value(x, quotes);
+    let p = crate::paper::pred(x, board, sym).cloned();
+    let now = now_ms();
+    let r = if buy {
+        crate::paper::buy(x, sym, cents.unwrap_or(0), price, v, lim, "manual", p.as_ref(), 0, now)
+    } else {
+        crate::paper::sell(x, sym, cents, price, "manual", p.as_ref(), now)
+    };
+    x.note = match r {
+        Ok(()) => format!("{} {sym} at {}", if buy { "bought" } else { "sold" }, crate::paper::fmt_cents(price)),
+        Err(e) => e,
+    };
+    let _ = crate::paper::tick(x, quotes, board, &[], 0, lim, now); // history point for the trade
+    crate::paper::save(book);
+    s.version += 1;
+}
+
+/// Once a second: AUTO trades, daily-loss reference and P/L history for every strategy.
+fn paper_loop(st: Shared) {
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        let mut s = st.lock().unwrap();
+        let lim = crate::paper::Limits { max_pos_pct: s.settings.max_position_pct as i64, day_stop_pct: s.settings.daily_loss_stop_pct as i64 };
+        let now = now_ms();
+        let State { book, quotes, board, settings, .. } = &mut *s;
+        let mut changed = false;
+        for x in book.iter_mut().filter(|x| x.ended_ms == 0) {
+            let min_conf = if x.models.first().is_some_and(|m| is_math(m)) { settings.math.min_conf } else { settings.ai.min_conf };
+            changed |= crate::paper::tick(x, quotes, board, &settings.watchlist, min_conf, lim, now);
+        }
+        if changed {
+            crate::paper::save(book);
+            s.version += 1;
+        }
     }
 }
 
@@ -205,7 +330,13 @@ fn fetch_loop(st: Shared) {
     loop {
         let (sel, tf, watch, poll) = {
             let s = st.lock().unwrap();
-            (s.selected.clone(), s.tf, s.settings.watchlist.clone(), s.settings.poll_ms.max(250))
+            let mut w = s.settings.watchlist.clone();
+            for p in s.book.iter().flat_map(|b| &b.positions) {
+                if !w.contains(&p.sym) {
+                    w.push(p.sym.clone());
+                }
+            }
+            (s.selected.clone(), s.tf, w, s.settings.poll_ms.max(250))
         };
         // one slot of each quote batch is kept for the charted symbol so its quote is always fresh
         let chunks: Vec<&[String]> = watch.chunks(yahoo::MAX_BATCH - 1).collect();

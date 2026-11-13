@@ -1,6 +1,8 @@
 mod ai;
 mod engine;
 mod kronos;
+mod paper;
+mod quant;
 mod shared;
 mod ui;
 mod viewer;

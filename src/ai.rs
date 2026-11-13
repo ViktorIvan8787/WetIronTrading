@@ -1,5 +1,5 @@
-//! Background AI loop in the engine: runs the candlestick prediction model on live candles
-//! and turns the sampled futures into statistics for the AI tab.
+//! Background forecast loops in the engine, one per desk: AI FORECAST (Kronos, Black-Scholes) and
+//! MATH FORECAST (quant.rs strategies). Both turn sampled futures into the same statistics.
 use crate::engine::Shared;
 use crate::kronos::{self, Kronos};
 use crate::shared::*;
@@ -7,6 +7,7 @@ use crate::yahoo::Yahoo;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Sampled futures per prediction; their spread gives P(up) and the p10..p90 range.
@@ -23,16 +24,30 @@ const SINGLE_REFRESH: Duration = Duration::from_secs(5);
 /// Each leaderboard symbol is re-predicted about once a minute (30 symbols x ~1 s each fits).
 const BOARD_REFRESH: Duration = Duration::from_secs(60);
 
-fn set_status(st: &Shared, msg: &str, clear: bool) {
+fn status(s: &mut crate::engine::State, math: bool) -> &mut String {
+    if math { &mut s.math_status } else { &mut s.ai_status }
+}
+
+/// Sets a desk's status line; `clear` also drops that desk's predictions (the other desk keeps its own).
+fn set_status(st: &Shared, math: bool, msg: &str, clear: bool) {
     let mut s = st.lock().unwrap();
-    if s.ai_status != msg || (clear && (!s.predictions.is_empty() || !s.board.is_empty())) {
-        s.ai_status = msg.to_string();
+    let has = s.predictions.keys().any(|k| k.0 == math) || s.board.keys().any(|k| is_math(&k.0) == math);
+    if status(&mut s, math) != msg || (clear && has) {
+        *status(&mut s, math) = msg.to_string();
         if clear {
-            s.predictions.clear();
-            s.board.clear();
+            s.predictions.retain(|k, _| k.0 != math);
+            s.board.retain(|k, _| is_math(&k.0) != math);
         }
         s.bump();
     }
+}
+
+/// What makes a desk's samples.
+#[derive(Clone, Copy)]
+enum Eng<'a> {
+    Kronos(&'a Kronos),
+    Mc,
+    Quant(&'static crate::quant::Strat),
 }
 
 /// Which panel a prediction feeds: one-stock PREDICTION OUTPUT or the LEADERBOARD / COMPARE.
@@ -43,10 +58,61 @@ enum Kind {
 }
 
 /// What the last run of (kind, model, symbol) used: last candle time + close, timeframe, horizon, when.
-type LastRun = HashMap<(Kind, String, String), (i64, f64, usize, usize, Instant)>;
+type LastRun = HashMap<(Kind, String, String, usize, usize), (i64, f64, usize, usize, Instant)>;
 
 /// Leaderboard candles are reused for this long, so two compared models share one download.
 const CANDLE_CACHE: Duration = Duration::from_secs(30);
+/// Other stocks' candles for cross-stock MATH strategies (pairs, PCA, ...).
+/// shortcut: up to 2 min old, so the partner's newest candle can lag on 1 MIN charts; refetch per job if it matters.
+const UNI_CACHE: Duration = Duration::from_secs(120);
+/// Company accounts change quarterly.
+const FUND_CACHE: Duration = Duration::from_secs(6 * 3600);
+
+type Cache = HashMap<(String, usize), (Instant, Vec<Candle>)>;
+
+/// Other symbols' candles and company accounts a MATH strategy needs (cached).
+#[allow(clippy::too_many_arguments)]
+fn gather(y: &Yahoo, st: &Shared, cache: &mut Cache, funds: &mut HashMap<String, (Instant, Vec<crate::quant::FundQ>)>, q: &crate::quant::Strat, sym: &str, tf: usize, watch: &[String]) -> crate::quant::Extra {
+    let mut ex = crate::quant::Extra::default();
+    let mut syms: Vec<String> = vec![];
+    if q.needs_universe() {
+        syms.extend(watch.iter().filter(|s| *s != sym).cloned());
+    }
+    if q.needs_etfs() {
+        syms.extend(crate::quant::FACTOR_ETFS.iter().map(|s| s.to_string()));
+    }
+    for s in syms {
+        let fresh = cache.get(&(s.clone(), tf)).filter(|c| c.0.elapsed() < UNI_CACHE).map(|c| c.1.clone());
+        let c = fresh.or_else(|| {
+            let c = fetch(y, st, &s, tf)?;
+            cache.insert((s.clone(), tf), (Instant::now(), c.clone()));
+            Some(c)
+        });
+        if let Some(c) = c {
+            ex.uni.push((s, c));
+        }
+    }
+    if q.needs_funds() {
+        let who: Vec<String> = std::iter::once(sym.to_string()).chain(if q.needs_universe() { watch.to_vec() } else { vec![] }).collect();
+        for s in who {
+            let f = match funds.get(&s) {
+                Some((t, f)) if t.elapsed() < FUND_CACHE => f.clone(),
+                _ => match y.fundamentals(&s) {
+                    Ok(f) => {
+                        funds.insert(s.clone(), (Instant::now(), f.clone()));
+                        f
+                    }
+                    Err(e) => {
+                        st.lock().unwrap().log(format!("MATH accounts {s}: {e}"));
+                        vec![]
+                    }
+                },
+            };
+            ex.funds.insert(s, f);
+        }
+    }
+    ex
+}
 
 fn fetch(y: &Yahoo, st: &Shared, sym: &str, tf: usize) -> Option<Vec<Candle>> {
     match y.chart(sym, TIMEFRAMES[tf].0, TIMEFRAMES[tf].1) {
@@ -58,10 +124,19 @@ fn fetch(y: &Yahoo, st: &Shared, sym: &str, tf: usize) -> Option<Vec<Candle>> {
     }
 }
 
-/// Ok(None) = Black-Scholes Monte Carlo (no files), Ok(Some) = Kronos (loaded on first use), Err = can't run.
-fn load_model<'a>(models: &'a mut HashMap<String, Kronos>, id: &str, st: &Shared) -> Result<Option<&'a Kronos>, String> {
+/// Kronos is loaded on first use; Err = can't run.
+fn load_model<'a>(models: &'a mut HashMap<String, Kronos>, id: &str, st: &Shared) -> Result<Eng<'a>, String> {
     if id == MC_MODEL {
-        return Ok(None);
+        return Ok(Eng::Mc);
+    }
+    if is_math(id) {
+        return match crate::quant::find(id) {
+            Some(q) => match q.run {
+                crate::quant::Run::Na(why) => Err(format!("{} can't run here: {why}", q.name)),
+                _ => Ok(Eng::Quant(q)),
+            },
+            None => Err(format!("unknown strategy {id}")),
+        };
     }
     let Some((pdir, tdir, ctx)) = kronos_files(id) else {
         return Err(format!("{id} has no Rust implementation yet - pick Kronos or Black-Scholes"));
@@ -70,12 +145,12 @@ fn load_model<'a>(models: &'a mut HashMap<String, Kronos>, id: &str, st: &Shared
         return Err(format!("model files missing: put {pdir} + {tdir} in {}", data_dir().join("models").display()));
     }
     if !models.contains_key(id) {
-        set_status(st, &format!("loading {id}..."), false);
+        set_status(st, false, &format!("loading {id}..."), false);
         let m = data_dir().join("models");
         let k = Kronos::load(&m.join(pdir), &m.join(tdir), ctx).map_err(|e| format!("{id} failed to load: {e}"))?;
         models.insert(id.to_string(), k);
     }
-    Ok(models.get(id))
+    Ok(Eng::Kronos(&models[id]))
 }
 
 /// A leaderboard prediction waiting for its last predicted candle to close.
@@ -93,13 +168,13 @@ struct Pending {
 
 /// Track record, saved to data_dir()/track.json: pending checks + direction hit counts.
 #[derive(Serialize, Deserialize, Default)]
-struct Track {
+pub struct Track {
     pending: Vec<Pending>,
     scores: Vec<TrackScore>,
 }
 
 impl Track {
-    fn load() -> Self {
+    pub fn load() -> Self {
         std::fs::read_to_string(data_dir().join("track.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
     }
     fn save(&self) {
@@ -145,26 +220,29 @@ impl Track {
     }
 }
 
-pub fn ai_loop(st: Shared) {
+/// One desk's loop (math = MATH FORECAST). Both desks share `track` (one track.json).
+pub fn ai_loop(st: Shared, track: Arc<Mutex<Track>>, math: bool) {
     let y = Yahoo::new();
     let mut models: HashMap<String, Kronos> = HashMap::new();
     let mut next_board = 0usize;
     let mut last: LastRun = HashMap::new();
-    let mut was_unusual: HashMap<(Kind, String, String), bool> = HashMap::new();
-    let mut board_cfg: (usize, usize, Vec<String>) = (usize::MAX, 0, vec![]);
+    let mut was_unusual: HashMap<(Kind, String, String, usize, usize), bool> = HashMap::new();
+    let mut streams_was: Vec<(String, usize, usize)> = vec![];
     let mut cur_model = String::new();
-    let mut cache: HashMap<(String, usize), (Instant, Vec<Candle>)> = HashMap::new();
-    let mut track = Track::load();
-    st.lock().unwrap().track = track.scores.clone();
+    let mut cache: Cache = HashMap::new();
+    let mut funds = HashMap::new();
+    st.lock().unwrap().track = track.lock().unwrap().scores.clone();
+    let desk = if math { "MATH" } else { "AI" };
     loop {
         std::thread::sleep(Duration::from_millis(250));
-        let (ai, sel, chart_tf, chart, watch, clients, off) = {
+        let (ai, sel, chart_tf, chart, watch, clients, off, strat_streams) = {
             let s = st.lock().unwrap();
-            (s.settings.ai.clone(), s.selected.clone(), s.candles_tf, s.candles.clone(), s.settings.watchlist.clone(), s.clients, s.session.map_or(-18_000, |x| x.gmtoffset))
+            let ss: Vec<(String, usize, usize)> = s.book.iter().filter(|b| b.ended_ms == 0).flat_map(|b| b.models.iter().filter(|m| is_math(m) == math).map(|m| (m.clone(), b.tf, b.h))).collect();
+            (if math { s.settings.math.clone() } else { s.settings.ai.clone() }, s.selected.clone(), s.candles_tf, s.candles.clone(), s.settings.watchlist.clone(), s.clients, s.session.map_or(-18_000, |x| x.gmtoffset), ss)
         };
         if !ai.enabled {
-            set_status(&st, "OFF", true);
-            board_cfg.0 = usize::MAX;
+            set_status(&st, math, "OFF", true);
+            streams_was.clear();
             continue;
         }
         if ai.model != cur_model {
@@ -172,68 +250,73 @@ pub fn ai_loop(st: Shared) {
             cur_model = ai.model.clone();
             last.retain(|k, _| k.0 != Kind::Single);
             let mut s = st.lock().unwrap();
-            s.predictions.clear();
+            s.predictions.retain(|k, _| k.0 != math);
             s.bump();
         }
         if !ai.background && clients == 0 {
-            set_status(&st, "paused - window closed and 'run in background' is OFF", false);
+            set_status(&st, math, "paused - window closed and 'run in background' is OFF", false);
             continue;
         }
-        // leaderboard models: both compared ones in COMPARE mode, else the picked one
-        let bmodels: Vec<String> = if ai.compare {
-            vec![ai.compare_a.clone(), ai.compare_b.clone()]
+        // prediction streams (model, timeframe, horizon) over the tracked stocks: the leaderboard's
+        // (both compared models in COMPARE mode, else the picked one) + every paper strategy's
+        let (btf, bh) = (ai.board_tf.min(TIMEFRAMES.len() - 1), ai.board_horizon.max(1) as usize);
+        let mut streams: Vec<(String, usize, usize)> = if ai.compare {
+            vec![(ai.compare_a.clone(), btf, bh), (ai.compare_b.clone(), btf, bh)]
         } else if ai.board {
-            vec![ai.model.clone()]
+            vec![(ai.model.clone(), btf, bh)]
         } else {
             vec![]
         };
-        models.retain(|id, _| *id == ai.model || bmodels.contains(id)); // free unused model memory
-        let bcfg = (ai.board_tf.min(TIMEFRAMES.len() - 1), ai.board_horizon.max(1) as usize, bmodels.clone());
-        if bcfg != board_cfg {
-            // timeframe/horizon changed: old ranks not comparable; models changed: drop the others
-            let mut s = st.lock().unwrap();
-            if (bcfg.0, bcfg.1) != (board_cfg.0, board_cfg.1) {
-                s.board.clear();
-            } else {
-                s.board.retain(|k, _| bcfg.2.contains(&k.0));
+        for x in strat_streams {
+            if !streams.contains(&x) {
+                streams.push(x);
             }
-            s.bump();
-            board_cfg = bcfg;
         }
-        let (btf, bh) = (board_cfg.0, board_cfg.1);
+        models.retain(|id, _| *id == ai.model || streams.iter().any(|x| &x.0 == id)); // free unused model memory
+        if streams != streams_was {
+            // drop predictions no stream needs any more (e.g. leaderboard timeframe changed)
+            let mut s = st.lock().unwrap();
+            s.board.retain(|k, _| is_math(&k.0) != math || streams.iter().any(|x| (&x.0, x.1, x.2) == (&k.0, k.1, k.2)));
+            s.bump();
+            streams_was = streams.clone();
+        }
 
         // 1) the charted symbol whenever its candles moved, 2) otherwise the next due leaderboard (model, symbol)
         let stf = if ai.input_tf == 0 { chart_tf } else { (ai.input_tf - 1).min(TIMEFRAMES.len() - 1) };
         let sh = ai.horizon.max(1) as usize;
         let ran = |kind: Kind, m: &str, sym: &str, tf: usize, h: usize, every: Duration| {
-            last.get(&(kind, m.to_string(), sym.to_string())).is_some_and(|e| e.2 == tf && e.3 == h && e.4.elapsed() < every)
+            last.get(&(kind, m.to_string(), sym.to_string(), tf, h)).is_some_and(|e| e.2 == tf && e.3 == h && e.4.elapsed() < every)
         };
         let single = if stf == chart_tf && !chart.is_empty() {
             let lc = chart[chart.len() - 1];
-            let same = last.get(&(Kind::Single, ai.model.clone(), sel.clone())).is_some_and(|e| e.0 == lc.t && e.1 == lc.c);
+            let same = last.get(&(Kind::Single, ai.model.clone(), sel.clone(), stf, sh)).is_some_and(|e| e.0 == lc.t && e.1 == lc.c);
             (!(same && ran(Kind::Single, &ai.model, &sel, stf, sh, SINGLE_REFRESH))).then_some(chart)
         } else if !ran(Kind::Single, &ai.model, &sel, stf, sh, SINGLE_REFRESH) {
             fetch(&y, &st, &sel, stf)
         } else {
             None
         };
-        let nm = board_cfg.2.len();
+        let nm = streams.len();
         let job = match single {
             Some(c) => Some((Kind::Single, ai.model.clone(), sel.clone(), c, stf, sh)),
             None if nm > 0 && !watch.is_empty() => {
                 // symbol-major so both compared models fill the same stock back to back
                 let n = watch.len() * nm;
-                let due = (0..n).map(|i| (next_board + i) % n).find(|&i| !ran(Kind::Board, &board_cfg.2[i % nm], &watch[i / nm], btf, bh, BOARD_REFRESH));
+                let due = (0..n).map(|i| (next_board + i) % n).find(|&i| {
+                    let x = &streams[i % nm];
+                    !ran(Kind::Board, &x.0, &watch[i / nm], x.1, x.2, BOARD_REFRESH)
+                });
                 due.and_then(|i| {
                     next_board = i + 1;
-                    let (m, sym) = (board_cfg.2[i % nm].clone(), watch[i / nm].clone());
+                    let ((m, btf, bh), sym) = (streams[i % nm].clone(), watch[i / nm].clone());
                     let fresh = cache.get(&(sym.clone(), btf)).filter(|c| c.0.elapsed() < CANDLE_CACHE).map(|c| c.1.clone());
                     let c = fresh.or_else(|| {
                         let c = fetch(&y, &st, &sym, btf)?;
                         cache.insert((sym.clone(), btf), (Instant::now(), c.clone()));
-                        if track.resolve(&sym, btf, &c) {
-                            track.save();
-                            st.lock().unwrap().track = track.scores.clone();
+                        let mut t = track.lock().unwrap();
+                        if t.resolve(&sym, btf, &c) {
+                            t.save();
+                            st.lock().unwrap().track = t.scores.clone();
                         }
                         Some(c)
                     })?;
@@ -244,14 +327,14 @@ pub fn ai_loop(st: Shared) {
         };
         let Some((kind, mid, sym, candles, tf, h)) = job else { continue };
         let lc = candles.last().copied();
-        let key = (kind, mid.clone(), sym.clone());
+        let key = (kind, mid.clone(), sym.clone(), tf, h);
         let k = match load_model(&mut models, &mid, &st) {
             Ok(k) => k,
             Err(e) => {
                 if kind == Kind::Single {
-                    set_status(&st, &e, false);
+                    set_status(&st, math, &e, false);
                 } else {
-                    st.lock().unwrap().log(format!("COMPARE/LEADERBOARD: {e}"));
+                    st.lock().unwrap().log(format!("{desk} COMPARE/LEADERBOARD: {e}"));
                 }
                 if let Some(lc) = lc {
                     last.insert(key, (lc.t, lc.c, tf, h, Instant::now()));
@@ -260,9 +343,13 @@ pub fn ai_loop(st: Shared) {
             }
         };
         let t0 = Instant::now();
-        let Some(mut p) = predict_one(k, &sym, &candles, tf, h, ai.lookback as usize, ai.min_conf, off) else {
+        let extra = match crate::quant::find(&mid) {
+            Some(q) if q.needs_universe() || q.needs_etfs() || q.needs_funds() => gather(&y, &st, &mut cache, &mut funds, q, &sym, tf, &watch),
+            _ => crate::quant::Extra::default(),
+        };
+        let Some(mut p) = predict_one(k, &sym, &candles, tf, h, ai.lookback as usize, ai.min_conf, off, &extra) else {
             if kind == Kind::Single {
-                set_status(&st, &format!("waiting for candles ({} of {MIN_CANDLES} needed)", candles.len()), false);
+                set_status(&st, math, &format!("waiting for candles ({} of {MIN_CANDLES} needed)", candles.len()), false);
             }
             if let Some(lc) = lc {
                 last.insert(key, (lc.t, lc.c, tf, h, Instant::now())); // don't hammer short histories
@@ -273,21 +360,21 @@ pub fn ai_loop(st: Shared) {
         p.model = mid.clone();
         let lc = lc.unwrap();
         last.insert(key.clone(), (lc.t, lc.c, tf, h, Instant::now()));
-        if kind == Kind::Board && track.add(Pending { model: mid.clone(), sym: sym.clone(), tf, h, made_t: lc.t, target_t: p.steps[h - 1].t, last: lc.c, up: p.exp_pct > 0.0 }) {
-            track.save();
+        if kind == Kind::Board && p.samples > 0 && track.lock().unwrap().add(Pending { model: mid.clone(), sym: sym.clone(), tf, h, made_t: lc.t, target_t: p.steps[h - 1].t, last: lc.c, up: p.exp_pct > 0.0 }) {
+            track.lock().unwrap().save();
         }
 
         let mut s = st.lock().unwrap();
         let gpu = if ai.gpu { " | GPU not supported yet, using CPU" } else { "" };
-        s.ai_status = format!("RUNNING - last: {sym} ({mid}) in {} ms{gpu}", p.ms);
+        *status(&mut s, math) = format!("RUNNING - last: {sym} ({mid}) in {} ms{gpu}", p.ms);
         let newly = p.unusual && !was_unusual.get(&key).copied().unwrap_or(false);
         was_unusual.insert(key, p.unusual);
         if newly && ai.notify {
-            s.alert(&format!("AI: unusual rise predicted for {sym} ({mid}): {:+.2}% over next {h} x {}, P(up) {:.0}%", p.exp_pct, TIMEFRAMES[tf].2, p.p_up * 100.0));
+            s.alert(&format!("{desk}: unusual rise predicted for {sym} ({mid}): {:+.2}% over next {h} x {}, P(up) {:.0}%", p.exp_pct, TIMEFRAMES[tf].2, p.p_up * 100.0));
         }
         match kind {
-            Kind::Single => s.predictions.insert(sym, p),
-            Kind::Board => s.board.insert((mid, sym), p),
+            Kind::Single => s.predictions.insert((math, sym), p),
+            Kind::Board => s.board.insert((mid, tf, h, sym), p),
         };
         s.bump();
     }
@@ -295,8 +382,9 @@ pub fn ai_loop(st: Shared) {
 
 /// One prediction from raw candles; None when there is too little history.
 #[allow(clippy::too_many_arguments)]
-fn predict_one(k: Option<&Kronos>, sym: &str, candles: &[Candle], tf: usize, h: usize, lookback: usize, min_conf: u32, off: i64) -> Option<Prediction> {
-    let lookback = lookback.min(k.map_or(usize::MAX, |k| k.max_context - h)).min(candles.len());
+fn predict_one(k: Eng, sym: &str, candles: &[Candle], tf: usize, h: usize, lookback: usize, min_conf: u32, off: i64, extra: &crate::quant::Extra) -> Option<Prediction> {
+    let ctx = if let Eng::Kronos(k) = k { k.max_context - h } else { usize::MAX };
+    let lookback = lookback.min(ctx).min(candles.len());
     if lookback < MIN_CANDLES {
         return None;
     }
@@ -309,16 +397,43 @@ fn predict_one(k: Option<&Kronos>, sym: &str, candles: &[Candle], tf: usize, h: 
     let mut hs = std::collections::hash_map::DefaultHasher::new();
     (sym, lc.t, tf, h).hash(&mut hs);
     let closes: Vec<f64> = window.iter().map(|c| c.c).collect();
-    let samples = match k {
-        Some(k) => k.predict(&x, &xs, &ys, SAMPLES, hs.finish()).ok()?,
-        None => monte_carlo(&closes, h, MC_PATHS, hs.finish()),
+    let (samples, signal) = match k {
+        Eng::Kronos(k) => (k.predict(&x, &xs, &ys, SAMPLES, hs.finish()).ok()?, String::new()),
+        Eng::Mc => (monte_carlo(&closes, h, MC_PATHS, hs.finish()), String::new()),
+        Eng::Quant(q) => match crate::quant::samples(q, sym, window, h, hs.finish(), extra) {
+            Ok(x) => x,
+            Err(why) => (vec![], why),
+        },
     };
-    let mut p = stats(&samples, &closes, &times, min_conf);
+    let mut p = if samples.is_empty() { no_signal(lc.c, &times) } else { stats(&samples, &closes, &times, min_conf) };
+    p.signal = signal;
     p.sym = sym.to_string();
     p.tf = tf;
     p.made_ms = now_ms();
     p.lookback = lookback;
     Some(p)
+}
+
+/// Stocks both models predicted, best agreement first: ordered by the WORSE of the two models'
+/// ranks (by expected %), ties by the sum, so both must rate it high. Also returns the Spearman
+/// rank correlation of the two models' expected moves (3+ shared stocks).
+pub fn agreement<'a>(pa: &[&'a Prediction], pb: &[&'a Prediction]) -> (Vec<(&'a Prediction, &'a Prediction)>, Option<f64>) {
+    let both: Vec<(&'a Prediction, &'a Prediction)> = pa.iter().filter_map(|x| pb.iter().find(|y| y.sym == x.sym).map(|y| (*x, *y))).collect();
+    let rank = |side: fn(&(&'a Prediction, &'a Prediction)) -> f64| -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..both.len()).collect();
+        idx.sort_by(|&i, &j| side(&both[j]).total_cmp(&side(&both[i])));
+        let mut r = vec![0; both.len()];
+        for (k, i) in idx.into_iter().enumerate() {
+            r[i] = k;
+        }
+        r
+    };
+    let (ra, rb) = (rank(|x| x.0.exp_pct), rank(|x| x.1.exp_pct));
+    let mut order: Vec<usize> = (0..both.len()).collect();
+    order.sort_by_key(|&i| (ra[i].max(rb[i]), ra[i] + rb[i]));
+    let n = both.len() as f64;
+    let rho = (both.len() >= 3).then(|| 1.0 - 6.0 * (0..both.len()).map(|i| (ra[i] as f64 - rb[i] as f64).powi(2)).sum::<f64>() / (n * (n * n - 1.0)));
+    (order.into_iter().map(|i| both[i]).collect(), rho)
 }
 
 /// Black-Scholes Monte Carlo: `paths` geometric-Brownian-motion price paths, h candles each.
@@ -359,15 +474,7 @@ pub fn monte_carlo(closes: &[f64], h: usize, paths: usize, seed: u64) -> Vec<Vec
 
 /// Timestamps of the next `n` candles. Daily skips weekends; intraday ignores session gaps (approximate).
 fn future_times(last: i64, tf: usize, n: usize) -> Vec<i64> {
-    let step = match TIMEFRAMES[tf].0 {
-        "1m" => 60,
-        "5m" => 300,
-        "15m" => 900,
-        "60m" => 3600,
-        "1d" => 86_400,
-        "1wk" => 7 * 86_400,
-        _ => 30 * 86_400,
-    };
+    let step = tf_secs(tf);
     let mut t = last;
     (0..n)
         .map(|_| {
@@ -383,7 +490,13 @@ fn future_times(last: i64, tf: usize, n: usize) -> Vec<i64> {
         .collect()
 }
 
-/// Turns sampled futures into the numbers shown in the AI tab.
+/// A MATH strategy with no forecast right now: flat path, 0 samples, P(up) 0 (never traded or flagged).
+fn no_signal(last: f64, times: &[i64]) -> Prediction {
+    let steps = times.iter().map(|&t| PredStep { t, o: last, h: last, l: last, c: last, c_lo: last, c_hi: last, p_up: 0.0 }).collect();
+    Prediction { last_close: last, steps, ..Default::default() }
+}
+
+/// Turns sampled futures into the numbers shown in the forecast tabs.
 pub fn stats(samples: &[Vec<[f64; 6]>], closes: &[f64], times: &[i64], min_conf: u32) -> Prediction {
     let last = *closes.last().unwrap();
     let n = samples.len() as f64;
@@ -400,7 +513,8 @@ pub fn stats(samples: &[Vec<[f64; 6]>], closes: &[f64], times: &[i64], min_conf:
                 c: col(3),
                 c_lo: cl.clone().fold(f64::MAX, f64::min),
                 c_hi: cl.clone().fold(f64::MIN, f64::max),
-                p_up: cl.filter(|c| *c > last).count() as f64 / n,
+                // Laplace's rule of succession: 16/16 samples up is ~94%, not certainty
+                p_up: (cl.filter(|c| *c > last).count() as f64 + 1.0) / (n + 2.0),
             }
         })
         .collect();
@@ -473,9 +587,9 @@ mod tests {
     fn flags_only_big_confident_rises() {
         let closes: Vec<f64> = (0..50).map(|i| 100.0 + if i % 2 == 0 { 0.1 } else { -0.1 }).collect(); // ~0.2% typical move
         let t = [1, 2];
-        // every sample +3%: way above 2 sigma, P(up) 100%
+        // every sample +3%: way above 2 sigma, P(up) 17/18 (never a flat 100%)
         let p = stats(&vec![path(102.9); 16], &closes, &t, 70);
-        assert!(p.unusual && p.z > UNUSUAL_Z && p.p_up == 1.0);
+        assert!(p.unusual && p.z > UNUSUAL_Z && p.p_up == 17.0 / 18.0);
         // tiny rise: normal
         assert!(!stats(&vec![path(99.95); 16], &closes, &t, 70).unusual);
         // big mean rise but only half the samples up: below confidence

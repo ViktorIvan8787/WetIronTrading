@@ -13,16 +13,25 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-pub const TABS: [&str; 9] = ["MAIN", "SCAN", "STRAT", "FORECAST", "BACKTEST", "DATA", "STORAGE", "MATHS", "SETTINGS"];
+pub const TABS: [&str; 12] = ["MAIN", "CURRENT SHARES", "HISTORY", "SCAN", "STRAT", "AI FORECAST", "MATH FORECAST", "BACKTEST", "DATA", "STORAGE", "MATHS", "SETTINGS"];
+/// Same tabs, shorter, for narrow windows.
+pub const TABS_SHORT: [&str; 12] = ["MAIN", "SHARES", "HISTORY", "SCAN", "STRAT", "AI FC", "MATH FC", "BACKTEST", "DATA", "STORAGE", "MATHS", "SETTINGS"];
 pub const T_MAIN: usize = 0;
-pub const T_SCAN: usize = 1;
-pub const T_STRAT: usize = 2;
-pub const T_AI: usize = 3;
-pub const T_BACKTEST: usize = 4;
-pub const T_DATA: usize = 5;
-pub const T_STORAGE: usize = 6;
-pub const T_MATHS: usize = 7;
-pub const T_SETTINGS: usize = 8;
+pub const T_SHARES: usize = 1;
+pub const T_HISTORY: usize = 2;
+pub const T_SCAN: usize = 3;
+pub const T_STRAT: usize = 4;
+pub const T_AI: usize = 5;
+pub const T_MATHF: usize = 6;
+pub const T_BACKTEST: usize = 7;
+pub const T_DATA: usize = 8;
+pub const T_STORAGE: usize = 9;
+pub const T_MATHS: usize = 10;
+pub const T_SETTINGS: usize = 11;
+/// Strategy window tabs.
+pub const STRAT_TABS: [&str; 2] = ["BUY/SELL", "HISTORY"];
+/// Order amount choices in the strategy window, cents ($100 .. $25,000).
+pub const AMOUNTS: [i64; 8] = [10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000];
 pub const AI_ROWS: usize = 8; // candlestick prediction model settings rows
 pub const HORIZONS: [u32; 5] = [1, 3, 5, 10, 20]; // "next N candles" choices
 pub const SETTING_ROWS: usize = 8;
@@ -38,8 +47,20 @@ pub enum Click {
     Chart,
     /// clickable value in an AI panel's top line: 0 one-stock timeframe, 1 one-stock horizon,
     /// 2 leaderboard on/off, 3 leaderboard timeframe, 4 leaderboard horizon, 5 COMPARE on/off,
-    /// 6 compared model A, 7 compared model B
+    /// 6 compared model A, 7 compared model B; strategy window: 10 AUTO, 11 amount down,
+    /// 12 amount up, 13 BUY, 14 SELL, 15 SELL ALL, 16 TERMINATE, 17 SIZE, 18 STOP-LOSS,
+    /// 19 TRAILING STOP, 20 MAX HOLD
     Ctl(u8),
+    /// FORECAST tab TEST button
+    Test,
+    /// a strategy: main window opens its window, a strategy window switches to it
+    Strat(u64),
+    /// a P/L history point in the strategy window
+    Hist(usize),
+    /// TERMINATE a running strategy (click twice)
+    End(u64),
+    /// DELETE an ended run from HISTORY (click twice)
+    Del(u64),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -78,6 +99,12 @@ pub struct App {
     pub started: Instant,
     pub storage: Storage,
     pub maths: Result<Vec<MathEntry>, String>,
+    /// Some(id) = this is a strategy window, not the main app
+    pub strat: Option<u64>,
+    pub sym_sel: String, // strategy window: picked stock
+    pub amount: i64,     // strategy window: order size, cents
+    pub hist_sel: usize, // strategy window: picked history point (0 = newest)
+    pub confirm: Option<(u64, Instant)>, // TERMINATE / DELETE armed by a first click
     quit: bool,
     writer: Arc<Mutex<Option<TcpStream>>>,
     stopped: Arc<AtomicBool>,
@@ -111,14 +138,26 @@ fn open_in_own_window() -> bool {
     Command::new("wt.exe").args(["-w", "new", "--maximized", "new-tab", "-p", "WetIronTrading"]).spawn().is_ok()
 }
 
+/// A strategy's own window: same WT profile (font/colours), running `wetiron strat <id>`.
+fn open_strategy_window(id: u64) -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let exe = exe.display().to_string();
+    let id = id.to_string();
+    Command::new("wt.exe").args(["-w", "new", "--maximized", "new-tab", "-p", "WetIronTrading", "--title", "WetIronTrading STRATEGY", &exe, "strat", &id]).spawn().is_ok()
+}
+
 pub fn run() -> std::io::Result<()> {
-    // `ui` = already inside our own window; anything else (double-click, cargo run) hops into it
-    if std::env::args().nth(1).as_deref() != Some("ui") && open_in_own_window() {
+    // `ui` = already inside our own window, `strat <id>` = a strategy window;
+    // anything else (double-click, cargo run) hops into our own window
+    let args: Vec<String> = std::env::args().collect();
+    let strat = (args.get(1).map(String::as_str) == Some("strat")).then(|| args.get(2).and_then(|s| s.parse().ok())).flatten();
+    if args.get(1).map(String::as_str) != Some("ui") && strat.is_none() && open_in_own_window() {
         return Ok(());
     }
     let (settings, warn) = Settings::load();
     let (tx, rx) = mpsc::channel();
     let mut app = App::new(settings);
+    app.strat = strat;
     {
         let (w, s) = (app.writer.clone(), app.stopped.clone());
         thread::spawn(move || connect_loop(tx, w, s));
@@ -127,7 +166,7 @@ pub fn run() -> std::io::Result<()> {
         app.flash(w);
     }
     let mut term = ratatui::init();
-    execute!(std::io::stdout(), EnableMouseCapture, SetTitle("WetIronTrading"))?;
+    execute!(std::io::stdout(), EnableMouseCapture, SetTitle(if strat.is_some() { "WetIronTrading STRATEGY" } else { "WetIronTrading" }))?;
     let res = (|| {
         while !app.quit {
             while let Ok(m) = rx.try_recv() {
@@ -175,6 +214,11 @@ impl App {
         started: Instant::now(),
         storage: Storage::default(),
         maths: Ok(vec![]),
+        strat: None,
+        sym_sel: String::new(),
+        amount: 100_000,
+        hist_sel: 0,
+        confirm: None,
         quit: false,
         writer: Arc::new(Mutex::new(None)),
         stopped: Arc::new(AtomicBool::new(false)),
@@ -290,19 +334,53 @@ impl App {
         self.status_flash = Some((msg.into(), Instant::now()));
     }
 
-    /// An unusually high rise is currently predicted -> F4 FORECAST flashes.
-    pub fn ai_alert(&self) -> bool {
-        self.settings.ai.enabled && self.snap.predictions.iter().chain(&self.snap.board).any(|p| p.unusual)
+    /// An unusually high rise is currently predicted by that desk -> its FORECAST tab flashes.
+    pub fn ai_alert(&self, math: bool) -> bool {
+        let d = if math { &self.settings.math } else { &self.settings.ai };
+        d.enabled && self.snap.predictions.iter().chain(&self.snap.board).any(|p| p.unusual && is_math(&p.model) == math)
     }
 
-    /// MAIN has 5 panels, AI has 6 (the leaderboard).
+    /// AI FORECAST or MATH FORECAST is showing (same page, different models).
+    pub fn fc_tab(&self) -> bool {
+        self.tab == T_AI || self.tab == T_MATHF
+    }
+
+    pub fn math(&self) -> bool {
+        self.tab == T_MATHF
+    }
+
+    /// Settings of the forecast desk on screen (AI anywhere but MATH FORECAST).
+    pub fn desk(&self) -> &AiSettings {
+        if self.math() { &self.settings.math } else { &self.settings.ai }
+    }
+
+    /// Saves and sends the desk's settings; the engine applies them live.
+    fn send_desk(&mut self) {
+        self.settings.save();
+        let d = self.desk().clone();
+        self.send(if self.math() { ToEngine::Math(d) } else { ToEngine::Ai(d) });
+    }
+
+    /// The desk's forecast for the charted stock.
+    pub fn single_pred(&self) -> Option<&Prediction> {
+        let m = &self.desk().model;
+        self.snap.predictions.iter().find(|p| p.sym == self.snap.selected && &p.model == m)
+    }
+
+    /// MAIN has 5 panels, the forecast tabs 6 (the leaderboard).
     pub fn panel_count(&self) -> usize {
-        if self.tab == T_AI { 6 } else { 5 }
+        if self.fc_tab() { 6 } else { 5 }
     }
 
     /// Steps a clickable AI-panel value (see Click::Ctl); d = +1 next, -1 previous.
     fn adjust(&mut self, id: u8, d: i64) {
-        let a = &mut self.settings.ai;
+        if id >= 10 {
+            return self.strat_ctl(id, d);
+        }
+        let math = self.math();
+        // compared models cycle through the ones that can run right now
+        let ready: Vec<&str> = desk_models(math).into_iter().map(|m| m.0).filter(|id| model_status(id) == "READY").collect();
+        let a = if math { &mut self.settings.math } else { &mut self.settings.ai };
         let step = |v: usize, n: usize| (v as i64 + d).rem_euclid(n as i64) as usize;
         let hstep = |v: u32| HORIZONS[step(HORIZONS.iter().position(|h| *h == v).unwrap_or(2), HORIZONS.len())];
         match id {
@@ -313,17 +391,131 @@ impl App {
             4 => a.board_horizon = hstep(a.board_horizon),
             5 => a.compare = !a.compare,
             _ => {
-                // compared models cycle through the ones that can run right now
-                let ready: Vec<&str> = AI_MODELS.iter().map(|m| m.0).filter(|id| model_status(id) == "READY").collect();
                 let m = if id == 6 { &mut a.compare_a } else { &mut a.compare_b };
                 if let Some(next) = ready.get(step(ready.iter().position(|r| r == m).unwrap_or(0), ready.len().max(1))) {
                     *m = next.to_string();
                 }
             }
         }
-        self.settings.save();
-        let ai = self.settings.ai.clone();
-        self.send(ToEngine::Ai(ai));
+        self.send_desk();
+    }
+
+    /// TEST: paper strategies for compared models A, B and the pair at the leaderboard's
+    /// timeframe/horizon (re-used if this exact test exists), then the pair's window.
+    fn open_test(&mut self) {
+        let ai = self.desk();
+        let (a, b, tf, h) = (ai.compare_a.clone(), ai.compare_b.clone(), ai.board_tf.min(TIMEFRAMES.len() - 1), ai.board_horizon.max(1) as usize);
+        let found = self.snap.strategies.iter().find(|s| s.ended_ms == 0 && s.kind.ends_with("PAIR") && s.models == [a.clone(), b.clone()] && s.tf == tf && s.h == h).map(|s| s.id);
+        let id = match found {
+            Some(id) => id,
+            None => {
+                let group = now_ms() as u64 * 10; // ids group, +1, +2
+                self.send(ToEngine::NewTest { group, a, b, tf, h });
+                group
+            }
+        };
+        if !open_strategy_window(id) {
+            self.flash("could not open a window (Windows Terminal needed)");
+        }
+    }
+
+    /// The strategy this window shows (None until the engine has sent it).
+    pub fn strategy(&self) -> Option<&Strategy> {
+        self.strat.and_then(|id| self.snap.strategies.iter().find(|s| s.id == id))
+    }
+
+    /// Stocks a strategy window lists: tracked ones, plus anything it still holds.
+    pub fn strat_syms(&self) -> Vec<String> {
+        let mut v = self.settings.watchlist.clone();
+        for p in self.strategy().map_or(&[][..], |s| &s.positions) {
+            if !v.contains(&p.sym) {
+                v.push(p.sym.clone());
+            }
+        }
+        v
+    }
+
+    fn step_sym(&mut self, d: i64) {
+        let v = self.strat_syms();
+        let i = v.iter().position(|s| *s == self.sym_sel).map_or(0, |i| (i as i64 + d).clamp(0, v.len() as i64 - 1) as usize);
+        if let Some(s) = v.get(i) {
+            self.sym_sel = s.clone();
+        }
+    }
+
+    /// TERMINATE (del = false) or DELETE needs a second click on the same strategy within 5 s.
+    pub fn armed(&self, id: u64) -> bool {
+        self.confirm.is_some_and(|(c, t)| c == id && t.elapsed() < Duration::from_secs(5))
+    }
+
+    fn confirm_then(&mut self, id: u64, del: bool) {
+        if self.armed(id) {
+            self.confirm = None;
+            self.send(if del { ToEngine::Delete { id } } else { ToEngine::End { id } });
+            self.flash(if del { "run deleted" } else { "strategy terminated - everything sold, see F3 HISTORY" });
+        } else {
+            self.confirm = Some((id, Instant::now()));
+            self.flash(if del { "click DELETE again within 5 s to delete this run for good" } else { "click TERMINATE again within 5 s: sells everything at market and ends the strategy" });
+        }
+    }
+
+    fn strat_ctl(&mut self, id: u8, d: i64) {
+        let Some(sid) = self.strat else { return };
+        let sym = self.sym_sel.clone();
+        if id != 11 && id != 12 && self.strategy().is_some_and(|s| s.ended_ms > 0) {
+            return self.flash("this run has ended (see F3 HISTORY in the main window)");
+        }
+        match id {
+            16 => self.confirm_then(sid, false),
+            18..=20 => {
+                let Some(s) = self.strategy() else { return };
+                let (mut stop_pct, mut trail_pct, mut max_hold) = (s.stop_pct, s.trail_pct, s.max_hold);
+                let pcts = [0u32, 1, 2, 3, 5, 8, 10, 15];
+                let step = |v: u32| pcts[(pcts.iter().position(|x| *x == v).unwrap_or(0) as i64 + d).rem_euclid(pcts.len() as i64) as usize];
+                match id {
+                    18 => stop_pct = step(stop_pct),
+                    19 => trail_pct = step(trail_pct),
+                    _ => max_hold = !max_hold,
+                }
+                self.send(ToEngine::SetRisk { id: sid, stop_pct, trail_pct, max_hold });
+            }
+            17 => {
+                let vol_target = !self.strategy().is_some_and(|s| s.vol_target);
+                self.send(ToEngine::SetSize { id: sid, vol_target });
+            }
+            10 => {
+                let order = [Auto::Off, Auto::TopPicks, Auto::Unusual, Auto::Signal];
+                let cur = self.strategy().map_or(Auto::Off, |s| s.auto);
+                let i = order.iter().position(|x| *x == cur).unwrap_or(0) as i64;
+                let auto = order[(i + d).rem_euclid(order.len() as i64) as usize];
+                self.send(ToEngine::SetAuto { id: sid, auto });
+            }
+            11 | 12 => {
+                let dir = if id == 11 { -d.abs() } else { d.abs() };
+                let i = AMOUNTS.iter().position(|x| *x == self.amount).unwrap_or(3) as i64;
+                self.amount = AMOUNTS[(i + dir).clamp(0, AMOUNTS.len() as i64 - 1) as usize];
+            }
+            _ if sym.is_empty() => self.flash("pick a stock first"),
+            13 => self.send(ToEngine::Buy { id: sid, sym, cents: self.amount }),
+            14 => self.send(ToEngine::Sell { id: sid, sym, cents: Some(self.amount) }),
+            _ => self.send(ToEngine::Sell { id: sid, sym, cents: None }),
+        }
+    }
+
+    fn strat_key(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::F(n) if (1..=STRAT_TABS.len() as u8).contains(&n) => self.tab = n as usize - 1,
+            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Up if self.tab == 0 => self.step_sym(-1),
+            KeyCode::Down if self.tab == 0 => self.step_sym(1),
+            KeyCode::Up => self.hist_sel = self.hist_sel.saturating_sub(1),
+            KeyCode::Down => self.hist_sel += 1,
+            KeyCode::Char('b') => self.strat_ctl(13, 1),
+            KeyCode::Char('s') => self.strat_ctl(14, 1),
+            KeyCode::Char('+' | '=') => self.strat_ctl(12, 1),
+            KeyCode::Char('-') => self.strat_ctl(11, 1),
+            _ => {}
+        }
     }
 
     /// Picker contents: everything, or what starts with the text typed in the command bar.
@@ -336,9 +528,11 @@ impl App {
 
     fn row_count(&self) -> usize {
         match self.tab {
+            T_SHARES => ui::shares_lines(self).len(),
+            T_HISTORY => ui::history_lines(self).len(),
             T_SCAN => self.snap.quotes.len(),
             T_DATA => DATA_SOURCES.len() + EXECUTION.len(),
-            T_AI => AI_MODELS.len() + AI_ROWS,
+            T_AI | T_MATHF => desk_models(self.math()).len() + AI_ROWS,
             T_SETTINGS => SETTING_ROWS,
             T_MATHS => ui::maths_lines(self).len(),
             _ => 0,
@@ -390,7 +584,7 @@ impl App {
 
     fn select(&mut self, sym: &str) {
         self.send(ToEngine::Select(sym.trim().to_uppercase()));
-        if self.tab != T_AI {
+        if !self.fc_tab() {
             self.tab = T_MAIN;
         }
     }
@@ -462,20 +656,23 @@ impl App {
                     self.restart_engine();
                 }
             }
-            T_AI => {
-                let a = &mut self.settings.ai;
-                if let Some((id, label, _)) = AI_MODELS.get(i) {
+            T_AI | T_MATHF => {
+                let math = self.math();
+                let models = desk_models(math);
+                let a = if math { &mut self.settings.math } else { &mut self.settings.ai };
+                if let Some((id, label)) = models.get(i) {
                     a.model = id.to_string();
-                    let msg = match model_status(id) {
-                        "READY" => format!("{label} selected"),
-                        "NOT DOWNLOADED" => format!("{label}: model files not downloaded"),
+                    let msg = match (model_status(id), crate::quant::find(id).map(|q| &q.run)) {
+                        ("READY", _) => format!("{label} selected"),
+                        ("NOT DOWNLOADED", _) => format!("{label}: model files not downloaded"),
+                        (_, Some(crate::quant::Run::Na(why))) => format!("{label}: can't run here - {why} (see MATHS tab)"),
                         _ => format!("{label}: no Rust implementation yet, nothing will run"),
                     };
                     self.flash(msg);
                 } else {
-                    match i - AI_MODELS.len() {
+                    match i - models.len() {
                         0 => a.enabled = !a.enabled,
-                        1 => a.lookback = cycle(a.lookback, &[64, 128, 256, 512, 1024]),
+                        1 => a.lookback = cycle(a.lookback, &[64, 128, 256, 512, 1024, 2048]),
                         2 => a.overlay = !a.overlay,
                         3 => a.show_conf = !a.show_conf,
                         4 => a.min_conf = cycle(a.min_conf, &[50, 60, 70, 80, 90]),
@@ -485,9 +682,7 @@ impl App {
                         _ => return,
                     }
                 }
-                self.settings.save();
-                let ai = self.settings.ai.clone();
-                self.send(ToEngine::Ai(ai)); // engine applies it live, no restart
+                self.send_desk(); // engine applies it live, no restart
             }
             T_SETTINGS => {
                 let s = &mut self.settings;
@@ -513,13 +708,16 @@ impl App {
 
     /// MAIN and AI share the 5-panel grid (focus, maximise, chart zoom).
     fn grid_tab(&self) -> bool {
-        self.tab == T_MAIN || self.tab == T_AI
+        self.tab == T_MAIN || self.fc_tab()
     }
 
     fn on_key(&mut self, k: KeyEvent) {
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             self.quit = true;
             return;
+        }
+        if self.strat.is_some() {
+            return self.strat_key(k);
         }
         if self.help {
             self.help = false;
@@ -569,11 +767,25 @@ impl App {
         match (m.kind, hit) {
             (MouseEventKind::Down(MouseButton::Left), Some(c)) => match c {
                 Click::Tab(t) => self.set_tab(t),
+                Click::Sym(s) if self.strat.is_some() => self.sym_sel = s,
                 Click::Pick(s) | Click::Sym(s) => self.select(&s),
                 Click::PickScroll(d) => self.scroll_picker(d),
                 Click::Focus(i) => self.focus = i,
                 Click::Chart => self.focus = 0,
                 Click::Ctl(id) => self.adjust(id, 1),
+                Click::Test => self.open_test(),
+                Click::Strat(id) if self.strat.is_some() => {
+                    self.strat = Some(id);
+                    self.hist_sel = 0;
+                }
+                Click::Strat(id) => {
+                    if !open_strategy_window(id) {
+                        self.flash("could not open a window (Windows Terminal needed)");
+                    }
+                }
+                Click::Hist(i) => self.hist_sel = i,
+                Click::End(id) => self.confirm_then(id, false),
+                Click::Del(id) => self.confirm_then(id, true),
                 Click::Row(i) => {
                     self.sel_row = i;
                     self.activate(i);
@@ -585,6 +797,8 @@ impl App {
                     Click::Pick(_) | Click::PickScroll(_) => self.scroll_picker(d),
                     Click::Chart => self.zoom(d), // wheel up = zoom in
                     Click::Ctl(id) => self.adjust(id, d),
+                    Click::Hist(_) => self.hist_sel = (self.hist_sel as i64 + d).max(0) as usize,
+                    Click::Sym(_) if self.strat.is_some() => self.step_sym(d),
                     _ => self.sel_row = (self.sel_row as i64 + d).clamp(0, self.row_count().saturating_sub(1) as i64) as usize,
                 }
             }
@@ -636,6 +850,13 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
+    fn test_strategy() -> Strategy {
+        let pos = Position { sym: "AAPL".into(), micro: 2_500_000, cost: 25_000, opened_ms: now_ms() - 3_600_000, exp_pct: 1.2, p_up: 0.7, exit_t: 0, peak: 25_000 };
+        let trade = Trade { t_ms: now_ms() - 3_600_000, sym: "AAPL".into(), buy: true, micro: 2_500_000, price: 10_000, cents: 25_000, why: "manual".into(), exp_pct: 1.2, p_up: 0.7 };
+        let history = (0..40).map(|i| HistPoint { t_ms: now_ms() - (40 - i) * 60_000, value: 10_000_000 + (i % 7) * 1_000 - 3_000, cash: 9_975_000 }).collect();
+        Strategy { id: 1, group: 1, name: "Kronos-small + Black-Scholes (1 HOUR x5)".into(), kind: "AI PAIR".into(), mode: "PAPER".into(), models: vec!["kronos_small".into(), MC_MODEL.into()], tf: 3, h: 5, start: 10_000_000, cash: 9_975_000, positions: vec![pos], trades: vec![trade], history, note: "bought AAPL".into(), ..Default::default() }
+    }
+
     /// Click + wheel every clickable spot on every tab (both COMPARE states), redrawing after each.
     #[test]
     fn every_click_and_scroll_survives() {
@@ -647,14 +868,36 @@ mod tests {
         a.snap.selected = "AAPL".into();
         a.snap.candles = (0..300).map(|i| Candle { t: i * 60, o: 100.0, h: 101.0, l: 99.0, c: 100.5, v: 1 }).collect();
         let steps: Vec<PredStep> = (1..=5).map(|i| PredStep { t: 300 * 60 + i * 60, o: 100.0, h: 101.0, l: 99.0, c: 100.0, c_lo: 99.0, c_hi: 101.0, p_up: 0.5 }).collect();
-        a.snap.predictions = vec![Prediction { sym: "AAPL".into(), steps: steps.clone(), samples: 16, last_close: 100.0, ..Default::default() }];
-        let ai = a.settings.ai.clone();
-        a.snap.board = [&ai.model, &ai.compare_a, &ai.compare_b].iter().flat_map(|m| ["AAPL", "NVDA"].map(|s| Prediction { sym: s.into(), model: m.to_string(), steps: steps.clone(), exp_pct: 1.0, p_up: 0.6, ..Default::default() })).collect();
+        let (ai, m) = (a.settings.ai.clone(), a.settings.math.clone());
+        a.snap.predictions = [&ai.model, &m.model].map(|id| Prediction { sym: "AAPL".into(), model: id.clone(), steps: steps.clone(), samples: 16, last_close: 100.0, ..Default::default() }).to_vec();
+        a.snap.board = [&ai.model, &ai.compare_a, &ai.compare_b, &m.model, &m.compare_a, &m.compare_b].iter().flat_map(|m| ["AAPL", "NVDA"].map(|s| Prediction { sym: s.into(), model: m.to_string(), steps: steps.clone(), exp_pct: 1.0, p_up: 0.6, ..Default::default() })).collect();
+        let mut ended = test_strategy();
+        (ended.id, ended.ended_ms) = (7, now_ms());
+        let mut risky = test_strategy();
+        (risky.id, risky.stop_pct, risky.trail_pct, risky.max_hold, risky.auto, risky.cooldown) = (8, 3, 5, true, Auto::Signal, vec![("NVDA".into(), now_ms() + 60_000)]);
+        a.snap.strategies = vec![test_strategy(), ended, risky];
         let mut t = Terminal::new(TestBackend::new(220, 60)).unwrap();
+        // strategy windows first (plain + one with every risk setting on), then every main tab
+        for (strat, tab) in [(Some(1), 0), (Some(1), 1), (Some(8), 0)] {
+            a.strat = strat;
+            a.tab = tab;
+            t.draw(|f| a.hits = ui::draw(f, &a)).unwrap();
+            let spots: Vec<(u16, u16)> = a.hits.iter().map(|(r, _)| (r.x + r.width / 2, r.y + r.height / 2)).collect();
+            for (x, y) in spots {
+                for kind in [MouseEventKind::Moved, MouseEventKind::Down(MouseButton::Left), MouseEventKind::ScrollDown, MouseEventKind::ScrollUp] {
+                    a.strat = strat;
+                    a.tab = tab;
+                    a.on_mouse(MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE });
+                    t.draw(|f| a.hits = ui::draw(f, &a)).unwrap();
+                }
+            }
+        }
+        a.strat = None;
         for tab in 0..TABS.len() {
             for compare in [false, true] {
                 a.set_tab(tab);
                 a.settings.ai.compare = compare;
+                a.settings.math.compare = compare;
                 t.draw(|f| a.hits = ui::draw(f, &a)).unwrap();
                 let spots: Vec<(u16, u16)> = a.hits.iter().map(|(r, _)| (r.x + r.width / 2, r.y + r.height / 2)).collect();
                 for (x, y) in spots {
@@ -680,8 +923,16 @@ mod tests {
         a.snap.predictions = vec![Prediction { sym: "AAPL".into(), steps: (1..=5).map(|i| PredStep { t: 300 * 60 + i * 60, o: 104.0, h: 107.0, l: 103.0, c: 106.0, c_lo: 101.0, c_hi: 109.0, p_up: 0.8 }).collect(), unusual: true, samples: 16, last_close: 104.0, ..Default::default() }];
         a.snap.ai_status = "RUNNING".into();
         let ai = a.settings.ai.clone();
-        a.snap.board = [&ai.model, &ai.compare_a].iter().flat_map(|m| ["NVDA", "CL=F", "AMD"].iter().enumerate().map(|(i, s)| Prediction { sym: s.to_string(), model: m.to_string(), tf: 3, exp_pct: 2.0 - i as f64, p_up: 0.7, unusual: i == 0, made_ms: now_ms(), steps: a.snap.predictions[0].steps.clone(), ..Default::default() }).collect::<Vec<_>>()).collect();
+        let mut no_sig = a.snap.predictions[0].clone();
+        (no_sig.model, no_sig.samples, no_sig.signal) = (a.settings.math.model.clone(), 0, "no signal on the latest candle".into());
+        a.snap.predictions[0].model = ai.model.clone();
+        a.snap.predictions.push(no_sig);
+        let m = a.settings.math.clone();
+        a.snap.board = [&ai.model, &ai.compare_a, &m.model, &m.compare_a].iter().flat_map(|m| ["NVDA", "CL=F", "AMD"].iter().enumerate().map(|(i, s)| Prediction { sym: s.to_string(), model: m.to_string(), tf: 3, samples: i * 8, signal: "SIGNAL NOW".into(), exp_pct: 2.0 - i as f64, p_up: 0.7, unusual: i == 0, made_ms: now_ms(), steps: a.snap.predictions[0].steps.clone(), ..Default::default() }).collect::<Vec<_>>()).collect();
         a.snap.track = vec![TrackScore { model: ai.compare_a.clone(), sym: "AMD".into(), tf: 3, h: 5, hits: 4, total: 6 }, TrackScore { model: ai.compare_b.clone(), sym: "AMD".into(), tf: 3, h: 5, hits: 5, total: 6 }];
+        let mut ended = test_strategy();
+        (ended.id, ended.ended_ms, ended.positions) = (7, now_ms(), vec![]);
+        a.snap.strategies = vec![test_strategy(), ended];
         a.maths = load_maths();
         a.refresh_storage();
         a.flash("hello");
@@ -690,15 +941,25 @@ mod tests {
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             for tab in 0..TABS.len() {
                 for (help, maxed, tapes) in [(false, false, true), (true, true, false)] {
+                    a.strat = None;
                     a.tab = tab;
                     a.help = help;
                     a.maxed = maxed;
                     a.settings.tapes = tapes;
                     a.settings.ai.compare = help; // second pass draws COMPARE mode
+                    a.settings.math.compare = help;
                     a.cmd = if help { Some("A".into()) } else { None };
                     t.draw(|f| a.hits = ui::draw(f, &a)).unwrap();
                     if std::env::var("DUMP").is_ok_and(|d| d == format!("{tab}{w}")) && !help {
                         println!("{}", t.backend());
+                    }
+                    if tab < STRAT_TABS.len() {
+                        // the same tab number in a strategy window
+                        a.strat = Some(1);
+                        t.draw(|f| a.hits = ui::draw(f, &a)).unwrap();
+                        if std::env::var("DUMP").is_ok_and(|d| d == format!("s{tab}{w}")) && !help {
+                            println!("{}", t.backend());
+                        }
                     }
                 }
             }

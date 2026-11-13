@@ -37,12 +37,25 @@ pub struct Session {
 }
 
 /// Chart zoom levels, smallest first: (Yahoo interval, Yahoo range, axis label).
+/// Seconds per candle of TIMEFRAMES[tf] (a month counted as 30 days).
+pub fn tf_secs(tf: usize) -> i64 {
+    match TIMEFRAMES[tf.min(TIMEFRAMES.len() - 1)].0 {
+        "1m" => 60,
+        "5m" => 300,
+        "15m" => 900,
+        "60m" => 3600,
+        "1d" => 86_400,
+        "1wk" => 7 * 86_400,
+        _ => 30 * 86_400,
+    }
+}
+
 pub const TIMEFRAMES: &[(&str, &str, &str)] = &[
     ("1m", "1d", "1 MIN"),
     ("5m", "5d", "5 MIN"),
     ("15m", "1mo", "15 MIN"),
     ("60m", "3mo", "1 HOUR"),
-    ("1d", "1y", "1 DAY"),
+    ("1d", "5y", "1 DAY"), // 5 years: enough quarters for earnings-based maths strategies
     ("1wk", "5y", "1 WEEK"),
     ("1mo", "max", "1 MONTH"),
 ];
@@ -61,7 +74,9 @@ pub struct Snapshot {
     pub predictions: Vec<Prediction>, // one-stock panel
     pub board: Vec<Prediction>,       // leaderboard, tracked symbols only (one per model in compare mode)
     pub track: Vec<TrackScore>,       // how often past leaderboard predictions got the direction right
+    pub strategies: Vec<Strategy>,    // paper book (CURRENT SHARES)
     pub ai_status: String,
+    pub math_status: String,
     pub last_ok_ms: i64,
     pub healthy: bool,
 }
@@ -80,6 +95,99 @@ pub enum ToEngine {
     Stop,
     TestAlert,
     Ai(AiSettings),
+    Math(AiSettings),
+    /// TEST: three paper strategies for model a, model b and the pair (ids group, group+1, group+2)
+    NewTest { group: u64, a: String, b: String, tf: usize, h: usize },
+    /// buy `cents` worth of `sym` in strategy `id`
+    Buy { id: u64, sym: String, cents: i64 },
+    /// sell `cents` worth (None = all) of `sym` in strategy `id`
+    Sell { id: u64, sym: String, cents: Option<i64> },
+    SetAuto { id: u64, auto: Auto },
+    /// protective exits: stop-loss %, trailing stop % (0 = off), max hold = sell after h candles
+    SetRisk { id: u64, stop_pct: u32, trail_pct: u32, max_hold: bool },
+    /// AUTO buy sizing: equal money (false) or volatility targeting (true)
+    SetSize { id: u64, vol_target: bool },
+    /// terminate: sell everything at market, stop trading, move to HISTORY
+    End { id: u64 },
+    /// delete an ended run from HISTORY for good
+    Delete { id: u64 },
+}
+
+/// AUTO trading rule of a strategy (see paper::tick).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum Auto {
+    #[default]
+    Off,
+    /// hold the model's top 3 predicted rises (P(up) >= Min confidence); sell what drops out
+    TopPicks,
+    /// buy when the model flags an UNUSUAL rise, sell when its predicted horizon has passed
+    Unusual,
+    /// buy every stock the model(s) signal (rise, P(up) >= Min confidence), sell after h candles
+    Signal,
+}
+
+/// One held stock. Money in cents, shares in micro-shares (paper::SHARE per share).
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct Position {
+    pub sym: String,
+    pub micro: i64,
+    pub cost: i64, // cents paid for what is still held
+    pub opened_ms: i64,
+    pub exp_pct: f64, // prediction when first bought
+    pub p_up: f64,
+    pub exit_t: i64, // sell after this unix time (s) under UNUSUAL / SIGNAL / MAX HOLD; 0 = opened + h candles
+    #[serde(default)]
+    pub peak: i64, // highest market value seen (cents), for the trailing stop
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct Trade {
+    pub t_ms: i64,
+    pub sym: String,
+    pub buy: bool,
+    pub micro: i64,
+    pub price: i64, // cents per share
+    pub cents: i64, // money moved
+    pub why: String,
+    pub exp_pct: f64, // prediction at the time
+    pub p_up: f64,
+}
+
+/// P/L history point (log-spaced in time, see paper::record_gap_ms).
+#[derive(Serialize, Deserialize, Clone, Copy, Default, Debug)]
+pub struct HistPoint {
+    pub t_ms: i64,
+    pub value: i64, // cash + positions, cents
+    pub cash: i64,
+}
+
+/// A strategy being tested with (paper) money. Survives restarts via data_dir()/paper.json.
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(default)]
+pub struct Strategy {
+    pub id: u64,
+    pub group: u64, // strategies made by the same TEST press
+    pub name: String,
+    pub kind: String, // AI | AI PAIR | (later) MATHS, STRATEGY, NEWS ...
+    pub mode: String, // PAPER (LIVE later)
+    pub models: Vec<String>,
+    pub tf: usize, // TIMEFRAMES index its predictions use
+    pub h: usize,  // candles ahead
+    pub start: i64,
+    pub cash: i64,
+    pub positions: Vec<Position>,
+    pub trades: Vec<Trade>,
+    pub history: Vec<HistPoint>,
+    pub auto: Auto,
+    pub created_ms: i64,
+    pub day: (String, i64), // date + value when first seen that day (daily loss stop)
+    pub note: String,       // last refusal / message from the engine
+    pub ended_ms: i64,      // terminated at (0 = running); ended runs show in HISTORY, not CURRENT SHARES
+    pub vol_target: bool,   // AUTO buy size scaled by volatility targeting (quant "Volatility targeting")
+    pub stop_pct: u32,      // stop-loss: sell a position down this % from its cost (0 = off)
+    pub trail_pct: u32,     // trailing stop: sell a position this % below its best value (0 = off)
+    pub max_hold: bool,     // sell every position once its predicted horizon (h candles) has passed
+    pub cooldown: Vec<(String, i64)>, // (symbol, until ms): no AUTO re-buy after a stop
 }
 
 /// (id, label, implemented)
@@ -153,6 +261,30 @@ impl Default for AiSettings {
     }
 }
 
+impl AiSettings {
+    pub fn math() -> Self {
+        Self { model: "q:rsi2".into(), lookback: 1024, board_tf: 4, min_conf: 60, compare_a: "q:rsi2".into(), compare_b: "q:donchian".into(), ..Self::default() }
+    }
+}
+
+/// The two forecast desks: AI FORECAST (AI_MODELS) and MATH FORECAST (quant::STRATS, ids "q:...").
+pub fn is_math(id: &str) -> bool {
+    id.starts_with("q:")
+}
+
+/// (id, label) of every model a desk lists.
+pub fn desk_models(math: bool) -> Vec<(&'static str, &'static str)> {
+    if math { crate::quant::STRATS.iter().map(|s| (s.id, s.name)).collect() } else { AI_MODELS.iter().map(|m| (m.0, m.1)).collect() }
+}
+
+/// Short name of any model id (AI or MATH) for labels.
+pub fn model_label(id: &str) -> String {
+    match crate::quant::find(id) {
+        Some(s) => s.name.to_string(),
+        None => AI_MODELS.iter().find(|m| m.0 == id).map_or(id, |m| m.1.split(" (").next().unwrap_or(m.1)).to_string(),
+    }
+}
+
 /// Simulation model (no files): Black-Scholes price paths, see ai::monte_carlo.
 pub const MC_MODEL: &str = "bs_mc";
 
@@ -170,6 +302,7 @@ pub fn kronos_files(id: &str) -> Option<(&'static str, &'static str, usize)> {
 pub fn model_status(id: &str) -> &'static str {
     match kronos_files(id) {
         None if id == MC_MODEL => "READY",
+        None if is_math(id) => if crate::quant::find(id).is_some_and(|s| s.runnable()) { "READY" } else { "N/A" },
         None => "N/A",
         Some((p, t, _)) => {
             let m = data_dir().join("models");
@@ -220,6 +353,7 @@ pub struct Prediction {
     pub sigma_pct: f64, // typical move over the same number of candles, from recent history
     pub z: f64,         // expected move in units of sigma
     pub unusual: bool,  // unusually high predicted rise (see ai::UNUSUAL_Z)
+    pub signal: String, // MATH strategies: why this forecast / why none ("" = AI model)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -241,6 +375,7 @@ pub struct Settings {
     pub poll_ms: u64,
     pub watchlist: Vec<String>,
     pub ai: AiSettings,
+    pub math: AiSettings, // MATH FORECAST desk: same knobs, models = quant::STRATS ids ("q:...")
 }
 
 impl Default for Settings {
@@ -264,6 +399,7 @@ impl Default for Settings {
             poll_ms: 2000,
             watchlist: w.split_whitespace().map(String::from).collect(),
             ai: AiSettings::default(),
+            math: AiSettings::math(),
         }
     }
 }

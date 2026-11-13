@@ -538,22 +538,30 @@ impl Kronos {
         }
         let norm: Vec<f32> = x.iter().flat_map(|r| (0..6).map(move |c| (((r[c] - mean[c]) / (std[c] + 1e-5)) as f32).clamp(-CLIP, CLIP))).collect();
         let samples = samples.max(1);
-        let (base, dec_base) = self.prefill(&norm, x_stamp);
+        let (base, dec_base, recon) = self.prefill(&norm, x_stamp);
+        // The tokenizer decodes an extreme last candle (far from the window mean) back toward the mean,
+        // up to ~0.5% off. Samples continue from that decoded level, so every path would "move" by that
+        // error before the model predicts anything. Re-anchor prices to the real last close.
+        let decoded_last = recon[(n - 1) * 6 + 3] as f64 * (std[3] + 1e-5) + mean[3];
+        let anchor = if decoded_last > 0.0 && x[n - 1][3] > 0.0 { x[n - 1][3] / decoded_last } else { 1.0 };
         let mut st = base.fork(samples);
         let toks = self.generate(&mut st, y_stamp, &mut Rng::new(seed));
         let mut dkv: Vec<Cache> = dec_base.iter().map(|c| c.fork(samples)).collect();
         let out = self.tok.decode(&toks.concat(), n, &mut dkv);
-        Ok(out.chunks(h * 6).map(|seq| seq.chunks(6).map(|r| std::array::from_fn(|c| r[c] as f64 * (std[c] + 1e-5) + mean[c])).collect()).collect())
+        let raw = |r: &[f32], c: usize| r[c] as f64 * (std[c] + 1e-5) + mean[c];
+        // columns 0..4 = o, h, l, c and 5 = amount scale with price; 4 = volume does not
+        Ok(out.chunks(h * 6).map(|seq| seq.chunks(6).map(|r| std::array::from_fn(|c| if c == 4 { raw(r, c) } else { raw(r, c) * anchor })).collect()).collect())
     }
 
     /// Context work shared by every sample: tokenise, run the predictor and the tokenizer decoder over it once.
-    fn prefill(&self, norm: &[f32], x_stamp: &[[usize; 5]]) -> (State, Vec<Cache>) {
+    /// Also returns the context as the tokenizer decodes it (normalised units).
+    fn prefill(&self, norm: &[f32], x_stamp: &[[usize; 5]]) -> (State, Vec<Cache>, Vec<f32>) {
         let toks = self.tok.encode(norm);
         let mut st = State::new(self.pred.blocks.len());
         self.pred.feed(&mut st, &toks, x_stamp);
         let mut dkv = vec![Cache::new(); self.tok.dec.len()];
-        self.tok.decode(&toks, 0, &mut dkv);
-        (st, dkv)
+        let recon = self.tok.decode(&toks, 0, &mut dkv);
+        (st, dkv, recon)
     }
 
     /// All sampled futures advance together, one step at a time. Returns tokens per sample.
@@ -622,7 +630,7 @@ mod tests {
         let xs: Vec<[usize; 5]> = (0..n as i64).map(|i| stamp(t0 + i * 60)).collect();
         let ys = [stamp(t0 + n as i64 * 60), stamp(t0 + (n as i64 + 1) * 60)];
         let toks = k.tok.encode(&norm);
-        let (st0, dkv) = k.prefill(&norm, &xs);
+        let (st0, dkv, _) = k.prefill(&norm, &xs);
         let mut st = st0.fork(1);
         let s1l = k.pred.s1_logits(&st);
         let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;

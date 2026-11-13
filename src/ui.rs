@@ -1,7 +1,9 @@
 //! Everything drawn: one green on black, all text, sections split by '|'.
 use crate::ai::UNUSUAL_Z;
 use crate::shared::*;
+use crate::paper::{self, SHARE};
 use crate::viewer::*;
+use std::collections::HashMap;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::symbols::border;
@@ -44,6 +46,10 @@ pub fn draw(f: &mut Frame, a: &App) -> Vec<(Rect, Click)> {
         f.render_widget(Paragraph::new("window too small").style(base()), area);
         return u.hits;
     }
+    if a.strat.is_some() {
+        u.strat_window(f, area);
+        return u.hits;
+    }
     let t = a.settings.tapes;
     let mut c = vec![Constraint::Length(1), Constraint::Length(1)];
     if t {
@@ -65,9 +71,11 @@ pub fn draw(f: &mut Frame, a: &App) -> Vec<(Rect, Click)> {
     u.status(f, rows[rows.len() - 1]);
     match a.tab {
         T_MAIN => u.grid(f, body, false),
+        T_SHARES => u.click_list(f, body, "CURRENT SHARES - running strategies, paper or live (click one = open its window, wheel = scroll)", shares_lines(a)),
+        T_HISTORY => u.click_list(f, body, "HISTORY - terminated runs, newest first (click one = open its window, wheel = scroll)", history_lines(a)),
         T_SCAN => u.scanner(f, body, true, true),
         T_STRAT => u.text(f, body, "STRATEGIES", false, strat_lines()),
-        T_AI => u.grid(f, body, true),
+        T_AI | T_MATHF => u.grid(f, body, true),
         T_BACKTEST => u.backtest(f, body),
         T_DATA => u.data(f, body),
         T_STORAGE => u.storage(f, body),
@@ -91,18 +99,23 @@ impl Ui<'_> {
 
     fn tabs(&mut self, f: &mut Frame, r: Rect) {
         let mut x = r.x;
-        // full " F1 MAIN " when wide, "1 MAIN" at 80 columns so all 9 tabs still fit
-        let pad = if r.width >= 104 { " " } else { "" };
-        let key = if r.width >= 84 { "F" } else { "" };
-        for (i, name) in TABS.iter().enumerate() {
-            let s = format!("{pad}{key}{} {name}{pad}", i + 1);
+        // widest style that fits: " F1 CURRENT SHARES " .. "SHARES" (no key numbers) at 80 columns
+        let label = |(pad, key, short, num): (&str, &str, bool, bool), i: usize| {
+            let name = if short { TABS_SHORT[i] } else { TABS[i] };
+            if num { format!("{pad}{key}{} {name}{pad}", i + 1) } else { name.to_string() }
+        };
+        let tiers = [(" ", "F", false, true), ("", "F", false, true), ("", "", false, true), ("", "", true, true), ("", "", true, false)];
+        let fits = |t: (&str, &str, bool, bool)| (0..TABS.len()).map(|i| label(t, i).len() + 1).sum::<usize>() <= r.width as usize;
+        let tier = tiers.into_iter().find(|t| fits(*t)).unwrap_or(tiers[4]);
+        for i in 0..TABS.len() {
+            let s = label(tier, i);
             let w = s.len() as u16;
             if x + w > r.right() {
                 break;
             }
             let rr = Rect::new(x, r.y, w, 1);
             let mut st = if self.a.tab == i || self.hover(rr) { inv() } else { base() };
-            if i == T_AI && self.a.ai_alert() {
+            if (i == T_AI || i == T_MATHF) && self.a.ai_alert(i == T_MATHF) {
                 // unusual predicted rise: blink twice a second
                 st = if (self.a.started.elapsed().as_millis() / 500) % 2 == 0 { inv() } else { base() };
             }
@@ -204,10 +217,17 @@ impl Ui<'_> {
         } else {
             let [top, bot] = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(r);
             // AI: leaderboard takes the companies + model slots top-right; those move to the bottom row
-            let (tp, bp): (&[u16], &[u16]) = if ai { (&[60, 40], &[20, 34, 20, 26]) } else { (&[60, 20, 20], &[50, 50]) };
-            let t = Layout::horizontal(tp.iter().map(|p| Constraint::Percentage(*p))).split(top);
+            let bp: &[u16] = if ai { &[20, 34, 20, 26] } else { &[50, 50] };
             let b = Layout::horizontal(bp.iter().map(|p| Constraint::Percentage(*p))).split(bot);
-            [&t[..], &b[..]].concat()
+            if ai {
+                // chart | TEST button | leaderboard
+                let [c, test, lb] = Layout::horizontal([Constraint::Percentage(56), Constraint::Length(15), Constraint::Min(0)]).areas(top);
+                self.test_button(f, test);
+                [&[c, lb][..], &b[..]].concat()
+            } else {
+                let t = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(20), Constraint::Percentage(20)]).split(top);
+                [&t[..], &b[..]].concat()
+            }
         };
         for (i, rr) in rects.into_iter().enumerate() {
             if a.maxed && i != focus {
@@ -245,12 +265,13 @@ impl Ui<'_> {
             None => format!("{} {tf}", a.snap.selected),
         };
         if ai {
-            let p = a.snap.predictions.iter().find(|p| p.sym == a.snap.selected);
-            title += &match p {
-                _ if !a.settings.ai.enabled => "  | AI PREDICTION OFF".to_string(),
-                Some(p) if a.settings.ai.show_conf => format!("  | AI {:+.2}% P(up) {:.0}%{}", p.exp_pct, p.p_up * 100.0, if p.unusual { " !! UNUSUAL" } else { "" }),
-                Some(p) => format!("  | AI {:+.2}%{}", p.exp_pct, if p.unusual { " !! UNUSUAL" } else { "" }),
-                None => "  | AI PREDICTION ON".to_string(),
+            let (d, k) = (a.desk(), if a.math() { "MATH" } else { "AI" });
+            title += &match a.single_pred() {
+                _ if !d.enabled => format!("  | {k} PREDICTION OFF"),
+                Some(p) if p.samples == 0 && !p.signal.is_empty() => format!("  | {k}: NO SIGNAL"),
+                Some(p) if d.show_conf => format!("  | {k} {:+.2}% P(up) {:.0}%{}", p.exp_pct, p.p_up * 100.0, if p.unusual { " !! UNUSUAL" } else { "" }),
+                Some(p) => format!("  | {k} {:+.2}%{}", p.exp_pct, if p.unusual { " !! UNUSUAL" } else { "" }),
+                None => format!("  | {k} PREDICTION ON"),
             };
         }
         let blk = panel(&title, focused);
@@ -277,7 +298,7 @@ impl Ui<'_> {
         let w = (inner.width - AXIS) as usize;
         let h = inner.height - 1; // last row = time axis
         // AI overlay: predicted candles to the right of a '┆' "now" line
-        let pred = a.snap.predictions.iter().find(|p| ai && a.settings.ai.enabled && a.settings.ai.overlay && p.sym == a.snap.selected && p.tf == a.snap.tf && p.steps.len() + 9 <= w);
+        let pred = a.single_pred().filter(|p| ai && a.desk().enabled && a.desk().overlay && p.samples > 0 && p.tf == a.snap.tf && p.steps.len() + 9 <= w);
         let pw = pred.map_or(0, |p| p.steps.len() + 1);
         let cs = &cs[cs.len().saturating_sub(w - pw)..];
         let mut hi = cs.iter().map(|c| c.h).fold(f64::MIN, f64::max);
@@ -383,20 +404,22 @@ impl Ui<'_> {
     }
 
     fn ai_models(&mut self, f: &mut Frame, r: Rect, focused: bool) {
-        let blk = panel("MODEL - AI or simulation (click to pick)", focused);
+        let math = self.a.math();
+        let blk = panel(if math { "STRATEGY - maths (click to pick, details in MATHS tab)" } else { "MODEL - AI or simulation (click to pick)" }, focused);
         let inner = blk.inner(r);
         f.render_widget(blk, r);
-        let cur = &self.a.settings.ai.model;
-        let lines = AI_MODELS.iter().map(|(id, label, _)| format!("{} {label:<34}[{}]", if id == cur { "[*]" } else { "[ ]" }, model_status(id))).collect();
+        let cur = &self.a.desk().model;
+        let lines = desk_models(math).into_iter().map(|(id, label)| format!("{} {label:<36}[{}]", if id == cur { "[*]" } else { "[ ]" }, model_status(id))).collect();
         self.rows(f, inner, 0, lines);
     }
 
     fn ai_settings(&mut self, f: &mut Frame, r: Rect, focused: bool) {
-        let blk = panel("CANDLESTICK PREDICTION MODEL (Enter/click toggles)", focused);
+        let math = self.a.math();
+        let blk = panel(if math { "MATH FORECAST SETTINGS (Enter/click toggles)" } else { "CANDLESTICK PREDICTION MODEL (Enter/click toggles)" }, focused);
         let inner = blk.inner(r);
         f.render_widget(blk, r);
-        let lines = (0..AI_ROWS).map(|i| ai_row(&self.a.settings.ai, i)).map(|(k, v)| format!("{k:<22}{v}")).collect();
-        self.rows(f, inner, AI_MODELS.len(), lines);
+        let lines = (0..AI_ROWS).map(|i| ai_row(self.a.desk(), i)).map(|(k, v)| format!("{k:<22}{v}")).collect();
+        self.rows(f, inner, desk_models(math).len(), lines);
     }
 
     /// One line of plain text with clickable [values] (click = next, wheel = step). Returns the space below.
@@ -424,7 +447,7 @@ impl Ui<'_> {
         let blk = panel("PREDICTION OUTPUT - charted stock", focused);
         let inner = blk.inner(r);
         f.render_widget(blk, r);
-        let ai = &a.settings.ai;
+        let ai = a.desk();
         let tf = match ai.input_tf {
             0 => format!("FOLLOW CHART ({})", TIMEFRAMES.get(a.tf).map_or("?", |t| t.2)),
             i => TIMEFRAMES[(i - 1).min(TIMEFRAMES.len() - 1)].2.to_string(),
@@ -437,7 +460,7 @@ impl Ui<'_> {
     /// The big COMPARE button turns it into model A vs model B side by side.
     fn leaderboard(&mut self, f: &mut Frame, r: Rect, focused: bool) {
         let a = self.a;
-        let ai = &a.settings.ai;
+        let ai = a.desk();
         let title = if ai.compare { "COMPARE - two models on the tracked stocks (click row = chart)" } else { "LEADERBOARD - tracked stocks, highest predicted rise first (click = chart)" };
         let blk = panel(title, focused);
         let inner = blk.inner(r);
@@ -463,13 +486,14 @@ impl Ui<'_> {
         let side = |y: u16| Rect::new(inner.x + bw + 1, inner.y + y, inner.width.saturating_sub(bw + 1), 1);
         let btf = ai.board_tf.min(TIMEFRAMES.len() - 1);
         let tfline = [("timeframe ".into(), None), (TIMEFRAMES[btf].2.to_string(), Some(3)), ("  next ".into(), None), (ai.board_horizon.to_string(), Some(4)), (format!(" candles  {}", ahead(btf, ai.board_horizon)), None)];
-        let of = |m: &str| a.snap.board.iter().filter(|p| p.model == m).count();
+        let on = |p: &&Prediction, m: &str| p.model == m && p.tf == btf && p.steps.len() == ai.board_horizon as usize;
+        let of = |m: &str| a.snap.board.iter().filter(|p| on(p, m)).count();
         let n = a.settings.watchlist.len();
         if ai.compare {
             self.controls(f, side(0), &[("A ".into(), None), (short(&ai.compare_a), Some(6)), ("  vs  B ".into(), None), (short(&ai.compare_b), Some(7))]);
             self.controls(f, side(1), &tfline);
-            let pa: Vec<&Prediction> = a.snap.board.iter().filter(|p| p.model == ai.compare_a).collect();
-            let pb: Vec<&Prediction> = a.snap.board.iter().filter(|p| p.model == ai.compare_b).collect();
+            let pa: Vec<&Prediction> = a.snap.board.iter().filter(|p| on(p, &ai.compare_a)).collect();
+            let pb: Vec<&Prediction> = a.snap.board.iter().filter(|p| on(p, &ai.compare_b)).collect();
             let hits = |m: &str| -> Vec<(&str, u32, u32)> { a.snap.track.iter().filter(|t| t.model == m && t.tf == btf && t.h == ai.board_horizon as usize).map(|t| (t.sym.as_str(), t.hits, t.total)).collect() };
             let c = compare(&pa, &pb, &hits(&ai.compare_a), &hits(&ai.compare_b));
             let rho = c.rho.map_or("-".into(), |r| format!("{r:+.2}"));
@@ -489,11 +513,13 @@ impl Ui<'_> {
                 *rest = Rect { y: rest.y + 1, height: rest.height - 1, ..*rest };
             }
         };
-        let mut b: Vec<&Prediction> = a.snap.board.iter().filter(|p| p.model == ai.model).collect();
+        let mut b: Vec<&Prediction> = a.snap.board.iter().filter(|p| on(p, &ai.model)).collect();
         let why = if !ai.enabled {
             Some(" (prediction model is OFF - switch it on in CANDLESTICK PREDICTION MODEL)")
         } else if !ai.board {
             Some(" (leaderboard OFF - click [OFF] above to predict all tracked stocks)")
+        } else if b.is_empty() && a.math() {
+            Some(" (strategies run in milliseconds; stocks fill in as their candles download)")
         } else if b.is_empty() {
             Some(" (predictions arrive one stock at a time: ~1-2 s each on Kronos-small, ~6-9 s on Kronos-base)")
         } else {
@@ -505,7 +531,8 @@ impl Ui<'_> {
             return;
         }
         put(&mut rest, format!("  {:<3}{:<8}{:>8}{:>7}{:>17}{:>7}{:>6}  {}", "#", "SYM", "EXP%", "P(UP)", "p10 .. p90", "Z", "AGE", "NAME"));
-        b.sort_by(|x, y| y.exp_pct.total_cmp(&x.exp_pct));
+        // MATH strategies with no signal right now go last
+        b.sort_by(|x, y| (x.samples == 0).cmp(&(y.samples == 0)).then(y.exp_pct.total_cmp(&x.exp_pct)));
         let now = now_ms();
         for (i, p) in b.into_iter().enumerate() {
             if rest.height == 0 {
@@ -515,7 +542,11 @@ impl Ui<'_> {
             let mark = if self.hover(rr) || p.sym == a.snap.selected { ">" } else { " " };
             let age = now.saturating_sub(p.made_ms) / 1000;
             let age = match age { 0..120 => format!("{age}s"), 120..7200 => format!("{}m", age / 60), _ => format!("{}h", age / 3600) };
-            let s = format!("{mark} {:<3}{:<8}{:>+7.2}%{:>6.0}%{:>+8.1}..{:<+7.1}{:>+7.2}{:>6}  {}{}", i + 1, p.sym, p.exp_pct, p.p_up * 100.0, p.p10_pct, p.p90_pct, p.z, age, if p.unusual { "!! " } else { "" }, name_of(a, &p.sym));
+            let s = if p.samples == 0 {
+                format!("{mark} {:<3}{:<8}  -- {}", i + 1, p.sym, p.signal)
+            } else {
+                format!("{mark} {:<3}{:<8}{:>+7.2}%{:>6.0}%{:>+8.1}..{:<+7.1}{:>+7.2}{:>6}  {}{}", i + 1, p.sym, p.exp_pct, p.p_up * 100.0, p.p10_pct, p.p90_pct, p.z, age, if p.unusual { "!! " } else { "" }, name_of(a, &p.sym))
+            };
             self.hits.push((rr, Click::Sym(p.sym.clone())));
             f.buffer_mut().set_stringn(rr.x, rr.y, s, w, base());
             rest = Rect { y: rest.y + 1, height: rest.height - 1, ..rest };
@@ -543,7 +574,11 @@ impl Ui<'_> {
             }
         }
         let hit = |h: &[(&str, u32, u32)], s: &str| h.iter().find(|x| x.0 == s).map_or("-".into(), |x| format!("{}/{} {:.0}%", x.1, x.2, x.1 as f64 * 100.0 / x.2 as f64));
-        let cell = |p: Option<&&Prediction>| p.map_or(format!("{:>7}{:>6}", "-", "-"), |p| format!("{:>+6.2}%{:>5.0}%", p.exp_pct, p.p_up * 100.0));
+        let cell = |p: Option<&&Prediction>| match p {
+            Some(p) if p.samples > 0 => format!("{:>+6.2}%{:>5.0}%", p.exp_pct, p.p_up * 100.0),
+            Some(_) => format!("{:>13}", "no signal"),
+            None => format!("{:>7}{:>6}", "-", "-"),
+        };
         for (i, (sym, pa, pb)) in c.rows.iter().enumerate() {
             let y = r.y + 3 + i as u16;
             if y >= r.bottom() {
@@ -557,6 +592,299 @@ impl Ui<'_> {
             let lit = !ag.is_empty() || !br.is_empty();
             f.buffer_mut().set_stringn(r.x, y, format!("{line:<w$}"), w, if lit { inv() } else { base() });
             self.hits.push((rr, Click::Sym(sym.to_string())));
+        }
+    }
+
+    /// Big TEST button next to the chart: paper-trade compared models A, B and the pair.
+    fn test_button(&mut self, f: &mut Frame, r: Rect) {
+        if r.width < 8 || r.height < 6 {
+            return;
+        }
+        let btn = Rect::new(r.x + 1, r.y, r.width - 2, 5);
+        self.big_button(f, btn, "TEST", Click::Test, false);
+        let n = self.a.snap.strategies.iter().filter(|s| s.kind.ends_with("PAIR")).count();
+        let lines = ["paper-trade", "model A, B", "and A+B with", "fake money", "(own window)", "", &format!("{n} test(s)"), "see F2", "CURRENT SHARES"];
+        for (i, l) in lines.iter().enumerate() {
+            let y = btn.bottom() + 1 + i as u16;
+            if y < r.bottom() {
+                f.buffer_mut().set_stringn(r.x + 1, y, l, (r.width - 1) as usize, base());
+            }
+        }
+    }
+
+    /// Boxed button (solid when hovered or `on`), label centred.
+    fn big_button(&mut self, f: &mut Frame, r: Rect, label: &str, click: Click, on: bool) {
+        let (w, h) = (r.width as usize, r.height);
+        if w < 4 || h < 1 {
+            return;
+        }
+        let solid = on || self.hover(r);
+        for i in 0..h {
+            let s = if solid {
+                if i == h / 2 { format!("{label:^w$}") } else { " ".repeat(w) }
+            } else if h >= 3 && (i == 0 || i == h - 1) {
+                format!("+{}+", "-".repeat(w - 2))
+            } else if i == h / 2 {
+                format!("|{label:^iw$}|", iw = w - 2)
+            } else {
+                format!("|{}|", " ".repeat(w - 2))
+            };
+            f.buffer_mut().set_stringn(r.x, r.y + i, s, w, if solid { inv() } else { base() });
+        }
+        self.hits.push((r, click));
+    }
+
+    /// Scrolling list of lines, some clickable (CURRENT SHARES, HISTORY).
+    fn click_list(&mut self, f: &mut Frame, r: Rect, title: &str, lines: Vec<(String, Option<Click>)>) {
+        let a = self.a;
+        let blk = panel(title, false);
+        let inner = blk.inner(r);
+        f.render_widget(blk, r);
+        self.hits.push((inner, Click::Focus(0))); // wheel anywhere scrolls
+        let top = a.sel_row.min(lines.len().saturating_sub(1));
+        for (i, (l, id)) in lines.into_iter().skip(top).enumerate() {
+            let y = inner.y + i as u16;
+            if y >= inner.bottom() {
+                break;
+            }
+            let rr = Rect::new(inner.x, y, inner.width, 1);
+            let mark = if id.is_some() && self.hover(rr) { ">" } else { " " };
+            let armed = matches!(id, Some(Click::End(x) | Click::Del(x)) if a.armed(x));
+            f.buffer_mut().set_stringn(inner.x, y, format!("{mark}{l}"), inner.width as usize, if armed { inv() } else { base() });
+            if let Some(c) = id {
+                self.hits.push((rr, c));
+            }
+        }
+    }
+
+    /// A strategy's own window: F1 BUY/SELL, F2 HISTORY.
+    fn strat_window(&mut self, f: &mut Frame, area: Rect) {
+        let a = self.a;
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).split(area);
+        let mut x = rows[0].x;
+        for (i, name) in STRAT_TABS.iter().enumerate() {
+            let s = format!(" F{} {name} ", i + 1);
+            let rr = Rect::new(x, rows[0].y, s.len() as u16, 1);
+            f.buffer_mut().set_string(x, rr.y, &s, if a.tab == i || self.hover(rr) { inv() } else { base() });
+            self.hits.push((rr, Click::Tab(i)));
+            x += rr.width;
+            f.buffer_mut().set_string(x, rr.y, "|", base());
+            x += 1;
+        }
+        self.status(f, rows[5]);
+        let Some(s) = a.strategy() else {
+            f.buffer_mut().set_string(rows[1].x, rows[1].y, format!(" waiting for strategy {} from the engine...", a.strat.unwrap_or(0)), base());
+            return;
+        };
+        let right = format!(" {} | {} | q = close ", s.name, s.kind);
+        let rw = right.chars().count() as u16;
+        if x + rw < rows[0].right() {
+            f.buffer_mut().set_string(rows[0].right() - rw, rows[0].y, right, base());
+        }
+        let q = quote_map(a);
+        // accounts of the same TEST: pair + each model
+        let mut accts: Vec<&Strategy> = a.snap.strategies.iter().filter(|x| x.group == s.group).collect();
+        accts.sort_by_key(|x| x.id);
+        let head = " accounts in this test: ";
+        f.buffer_mut().set_string(rows[1].x, rows[1].y, head, base());
+        let mut xx = rows[1].x + head.len() as u16;
+        for acc in accts {
+            let v = paper::value(acc, &q);
+            let who = if acc.models.len() > 1 { "A+B PAIR".to_string() } else { short(&acc.models[0]) };
+            let lbl = format!("[{who} {:+.2}%]", (v - acc.start) as f64 * 100.0 / acc.start.max(1) as f64);
+            let rr = Rect::new(xx, rows[1].y, (lbl.len() as u16).min(rows[1].right().saturating_sub(xx)), 1);
+            if rr.width == 0 {
+                break;
+            }
+            f.buffer_mut().set_stringn(xx, rr.y, &lbl, rr.width as usize, if acc.id == s.id || self.hover(rr) { inv() } else { base() });
+            self.hits.push((rr, Click::Strat(acc.id)));
+            xx += rr.width + 1;
+        }
+        let v = paper::value(s, &q);
+        let auto = match s.auto {
+            Auto::Off => "OFF",
+            Auto::TopPicks => "TOP PICKS (hold top 3 predicted rises, sell drop-outs)",
+            Auto::Unusual => "UNUSUAL (buy unusual rises, sell at predicted horizon)",
+            Auto::Signal => "SIGNAL (buy every stock the model signals, sell after the predicted horizon)",
+        };
+        let preds = format!("  | predictions {} x{} {}", TIMEFRAMES[s.tf.min(TIMEFRAMES.len() - 1)].2, s.h, ahead(s.tf.min(TIMEFRAMES.len() - 1), s.h as u32));
+        if s.ended_ms > 0 {
+            self.controls(f, rows[2], &[(format!(" ENDED {} | final value {} | P/L {} | ran {}{preds}", when(s.ended_ms), money(v), pl(v - s.start, s.start), age(s.ended_ms - s.created_ms)), None)]);
+        } else {
+            let end = if a.armed(s.id) { "CLICK AGAIN TO TERMINATE" } else { "TERMINATE" };
+            self.controls(f, rows[2], &[
+                (format!(" {} | value {} | P/L {} | cash {} | in shares {} | AUTO ", s.mode, money(v), pl(v - s.start, s.start), money(s.cash), money(v - s.cash)), None),
+                (auto.into(), Some(10)),
+                (preds, None),
+                ("  | SIZE ".into(), None),
+                (if s.vol_target { "VOL TARGET" } else { "EQUAL $" }.into(), Some(17)),
+                ("  ".into(), None),
+                (end.into(), Some(16)),
+            ]);
+            let pct = |v: u32| if v == 0 { "OFF".to_string() } else { format!("{v}%") };
+            let cooling: Vec<String> = s.cooldown.iter().map(|c| format!("{} {}", c.0, age(c.1 - now_ms()))).collect();
+            self.controls(f, rows[3], &[
+                (" RISK (any AUTO mode, also OFF): STOP-LOSS ".into(), None),
+                (pct(s.stop_pct), Some(18)),
+                ("  TRAILING STOP ".into(), None),
+                (pct(s.trail_pct), Some(19)),
+                ("  MAX HOLD ".into(), None),
+                (if s.max_hold { format!("ON = sell after {} candles", s.h) } else { "OFF".into() }, Some(20)),
+                (if cooling.is_empty() { String::new() } else { format!("  | no AUTO re-buy until cooled: {}", cooling.join(", ")) }, None),
+            ]);
+        }
+        if a.tab == 0 { self.trade_tab(f, rows[4], s, &q) } else { self.history_tab(f, rows[4], s) }
+    }
+
+    fn trade_tab(&mut self, f: &mut Frame, r: Rect, s: &Strategy, q: &HashMap<String, Quote>) {
+        let a = self.a;
+        let [l, rt] = Layout::horizontal([Constraint::Percentage(55), Constraint::Min(0)]).areas(r);
+        // STOCKS: tracked stocks with this strategy's model predictions
+        let blk = panel("STOCKS - click to pick, wheel/up/down to move", false);
+        let inner = blk.inner(l);
+        f.render_widget(blk, l);
+        let w = inner.width as usize;
+        let models: String = s.models.iter().map(|m| format!("| {:<19}", format!("{} EXP% P(UP)", short(m).chars().take(9).collect::<String>()))).collect();
+        f.buffer_mut().set_stringn(inner.x, inner.y, format!("  {:<9}{:>11}  {models}| {:>12}  NAME", "SYM", "PRICE", "HELD"), w, base());
+        for (i, sym) in a.strat_syms().iter().enumerate() {
+            let y = inner.y + 1 + i as u16;
+            if y >= inner.bottom() {
+                break;
+            }
+            let rr = Rect::new(inner.x, y, inner.width, 1);
+            let price = q.get(sym).map_or("-".into(), |x| px(x.price));
+            let cols: String = s.models.iter().map(|m| match pred_of(a, s, m, sym) {
+                Some(p) => format!("| {:>+7.2}% {:>5.0}%{:<4}", p.exp_pct, p.p_up * 100.0, if p.unusual { " !!" } else { "" }),
+                None => format!("| {:<19}", "  (predicting...)"),
+            }).collect();
+            let held = s.positions.iter().find(|p| &p.sym == sym).map_or(String::new(), |p| money(q.get(sym).map_or(p.cost, |x| p.micro * paper::cents(x) / SHARE)));
+            let mark = if self.hover(rr) { ">" } else { " " };
+            let line = format!("{mark} {sym:<9}{price:>11}  {cols}| {held:>12}  {}", name_of(a, sym));
+            f.buffer_mut().set_stringn(inner.x, y, format!("{line:<w$}"), w, if *sym == a.sym_sel { inv() } else { base() });
+            self.hits.push((rr, Click::Sym(sym.clone())));
+        }
+        let [order, pos, trades] = Layout::vertical([Constraint::Length(12), Constraint::Min(4), Constraint::Length(9)]).areas(rt);
+        // ORDER
+        let blk = panel("ORDER (paper money)", false);
+        let oi = blk.inner(order);
+        f.render_widget(blk, order);
+        let put = |f: &mut Frame, y: u16, s: String| {
+            if y < oi.bottom() {
+                f.buffer_mut().set_stringn(oi.x, y, s, oi.width as usize, base());
+            }
+        };
+        let sym = &a.sym_sel;
+        let price = q.get(sym).map(paper::cents);
+        put(f, oi.y, if sym.is_empty() { " stock   (click one on the left)".into() } else { format!(" stock   {sym}  {}  price {}", name_of(a, sym), price.map_or("-".into(), money)) });
+        let v = paper::value(s, q);
+        let cap = v * a.settings.max_position_pct as i64 / 100;
+        if oi.height > 2 {
+            self.controls(f, Rect { y: oi.y + 1, height: 1, ..oi }, &[(" amount  ".into(), None), (" - ".into(), Some(11)), (format!(" {} ", money(a.amount)), None), (" + ".into(), Some(12)), (format!("   max {}% per stock = {} | daily loss stop -{}%", a.settings.max_position_pct, money(cap), a.settings.daily_loss_stop_pct), None)]);
+        }
+        if oi.height >= 6 && oi.width >= 50 {
+            let bw = 14;
+            for (k, (lbl, id)) in [("BUY", 13u8), ("SELL", 14), ("SELL ALL", 15)].into_iter().enumerate() {
+                self.big_button(f, Rect::new(oi.x + 1 + k as u16 * (bw + 2), oi.y + 2, bw, 3), lbl, Click::Ctl(id), false);
+            }
+        }
+        if let Some(p) = s.positions.iter().find(|p| &p.sym == sym) {
+            let mv = price.map_or(p.cost, |c| p.micro * c / SHARE);
+            put(f, oi.y + 6, format!(" held    {:.4} sh  cost {}  value {}  P/L {}", p.micro as f64 / SHARE as f64, money(p.cost), money(mv), pl(mv - p.cost, p.cost)));
+        }
+        put(f, oi.y + 7, format!(" engine  {}", if s.note.is_empty() { "-" } else { &s.note }));
+        put(f, oi.y + 9, " keys    b buy | s sell | + - amount | up/down stock | F2 history | q close".into());
+        // POSITIONS
+        let blk = panel("POSITIONS (click = pick)", false);
+        let pi = blk.inner(pos);
+        f.render_widget(blk, pos);
+        let pw = pi.width as usize;
+        f.buffer_mut().set_stringn(pi.x, pi.y, format!("  {:<9}{:>12}{:>13}{:>11}{:>13}{:>22}  {:<14}{:<14}{}", "SYM", "SHARES", "COST", "NOW", "VALUE", "P/L", "PRED AT BUY", "PRED NOW", "HELD"), pw, base());
+        let now = now_ms();
+        for (i, p) in s.positions.iter().enumerate() {
+            let y = pi.y + 1 + i as u16;
+            if y >= pi.bottom() {
+                break;
+            }
+            let rr = Rect::new(pi.x, y, pi.width, 1);
+            let c = q.get(&p.sym).map(paper::cents);
+            let mv = c.map_or(p.cost, |c| p.micro * c / SHARE);
+            let pn = s.models.first().and_then(|m| pred_of(a, s, m, &p.sym)).map_or("-".into(), |x| format!("{:+.2}% {:.0}%", x.exp_pct, x.p_up * 100.0));
+            let line = format!("{} {:<9}{:>12.4}{:>13}{:>11}{:>13}{:>22}  {:<14}{:<14}{}", if self.hover(rr) { ">" } else { " " }, p.sym, p.micro as f64 / SHARE as f64, money(p.cost), c.map_or("-".into(), money), money(mv), pl(mv - p.cost, p.cost), format!("{:+.2}% {:.0}%", p.exp_pct, p.p_up * 100.0), pn, age(now - p.opened_ms));
+            f.buffer_mut().set_stringn(pi.x, y, line, pw, base());
+            self.hits.push((rr, Click::Sym(p.sym.clone())));
+        }
+        if s.positions.is_empty() {
+            f.buffer_mut().set_stringn(pi.x, pi.y + 1, "  (nothing held)", pw, base());
+        }
+        // TRADES, newest first
+        let lines: Vec<String> = s.trades.iter().rev().map(|t| {
+            let when = chrono::DateTime::from_timestamp_millis(t.t_ms).map_or(String::new(), |d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string());
+            format!(" {when}  {:<4} {:<9}{:>12.4} sh @ {:>10} = {:>12}  pred {:+.2}% {:.0}%  {}", if t.buy { "BUY" } else { "SELL" }, t.sym, t.micro as f64 / SHARE as f64, money(t.price), money(t.cents), t.exp_pct, t.p_up * 100.0, t.why)
+        }).collect();
+        self.text(f, trades, "TRADES (newest first)", false, if lines.is_empty() { vec![" (no trades yet)".into()] } else { lines });
+    }
+
+    fn history_tab(&mut self, f: &mut Frame, r: Rect, s: &Strategy) {
+        let a = self.a;
+        let pts = &s.history;
+        let n = pts.len();
+        if n == 0 {
+            self.text(f, r, "HISTORY", false, vec![" (no history yet - points start with the first trade)".into()]);
+            return;
+        }
+        let sel = a.hist_sel.min(n - 1); // 0 = newest
+        let idx = n - 1 - sel;
+        let [chart, table] = Layout::vertical([Constraint::Percentage(45), Constraint::Min(4)]).areas(r);
+        // chart: one '•' per point; x = point number (time is log-spaced), '-' = starting money
+        let blk = panel("P/L OVER TIME  (x = recorded points: dense early, sparser as the trade ages | '-' = start | '┆' = picked point)", false);
+        let ci = blk.inner(chart);
+        f.render_widget(blk, chart);
+        self.hits.push((ci, Click::Hist(sel)));
+        const AXIS: u16 = 15;
+        if ci.width > AXIS + 4 && ci.height >= 3 {
+            let w = (ci.width - AXIS) as usize;
+            let hi = pts.iter().map(|p| p.value).max().unwrap().max(s.start);
+            let lo = pts.iter().map(|p| p.value).min().unwrap().min(s.start);
+            let span = (hi - lo).max(1) as f64;
+            let row = |v: i64| ci.y + (((hi - v) as f64 / span) * (ci.height - 1) as f64).round() as u16;
+            let col = |i: usize| if n <= 1 { 0 } else { i * (w - 1) / (n - 1) };
+            let buf = f.buffer_mut();
+            for x in 0..w {
+                buf.set_string(ci.x + x as u16, row(s.start), "-", base());
+            }
+            for y in ci.y..ci.bottom() {
+                buf.set_string(ci.x + col(idx) as u16, y, "┆", base());
+            }
+            for (i, p) in pts.iter().enumerate() {
+                buf.set_string(ci.x + col(i) as u16, row(p.value), "•", base());
+            }
+            let ax = ci.x + w as u16 + 1;
+            for (y, v) in [(ci.y, hi), (row(s.start), s.start), (ci.bottom() - 1, lo)] {
+                buf.set_stringn(ax, y, money(v), (AXIS - 1) as usize, base());
+            }
+        }
+        // table, newest first
+        let blk = panel("HISTORY - wheel/up/down/click to move | a point every clamp(age / 60, 10 s, 12 h) since the first trade, + one per trade", false);
+        let ti = blk.inner(table);
+        f.render_widget(blk, table);
+        self.hits.push((ti, Click::Hist(sel)));
+        let tw = ti.width as usize;
+        f.buffer_mut().set_stringn(ti.x, ti.y, format!("  {:<6}{:<21}{:>10}{:>15}{:>24}{:>14}{:>15}", "#", "TIME", "AGE", "VALUE", "P/L", "CHANGE", "CASH"), tw, base());
+        let vis = ti.height.saturating_sub(1) as usize;
+        let top = sel.saturating_sub(vis.saturating_sub(1));
+        let first_t = s.trades.first().map_or(pts[0].t_ms, |t| t.t_ms);
+        for k in top..n {
+            let y = ti.y + 1 + (k - top) as u16;
+            if y >= ti.bottom() {
+                break;
+            }
+            let p = pts[n - 1 - k];
+            let prev = if n - 1 - k > 0 { pts[n - 2 - k].value } else { s.start };
+            let when = chrono::DateTime::from_timestamp_millis(p.t_ms).map_or(String::new(), |d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string());
+            let line = format!("  {:<6}{:<21}{:>10}{:>15}{:>24}{:>14}{:>15}", n - k, when, age(p.t_ms - first_t), money(p.value), pl(p.value - s.start, s.start), signed(p.value - prev), money(p.cash));
+            let rr = Rect::new(ti.x, y, ti.width, 1);
+            f.buffer_mut().set_stringn(ti.x, y, format!("{line:<tw$}"), tw, if k == sel || self.hover(rr) { inv() } else { base() });
+            self.hits.push((rr, Click::Hist(k)));
         }
     }
 
@@ -714,6 +1042,43 @@ impl Ui<'_> {
     }
 }
 
+/// Built-in strategy library (quant.rs): every listed strategy, explained, and where it runs in the app.
+fn library_lines() -> Vec<String> {
+    let mut v = vec![
+        " ==================== STRATEGY LIBRARY (built in) ====================".to_string(),
+        " RUNS = pick it in F7 MATH FORECAST (chart overlay, leaderboard, COMPARE, TEST paper trading).".into(),
+        " PATTERN rules forecast with what happened after every earlier time the rule fired on that stock".into(),
+        " (no lookahead); MODEL strategies fit their equation and simulate 500 paths. N/A = data this app lacks.".into(),
+    ];
+    let mut cat = "";
+    for q in crate::quant::STRATS {
+        if q.cat != cat {
+            cat = q.cat;
+            v.extend([String::new(), format!(" ---- {cat} ----")]);
+        }
+        let kind = match q.run {
+            crate::quant::Run::Pattern(_) => "RUNS (pattern rule)".to_string(),
+            crate::quant::Run::Model(_) => "RUNS (fitted model, simulated)".to_string(),
+            crate::quant::Run::Rule(_) => "RUNS (rule using other stocks / accounts / learning)".to_string(),
+            crate::quant::Run::CtxModel(_) => "RUNS (fitted model on factor ETFs, simulated)".to_string(),
+            crate::quant::Run::Sizing => "RUNS as a SIZE rule in strategy windows (not a forecast)".to_string(),
+            crate::quant::Run::Na(why) => format!("N/A - {why}"),
+        };
+        v.push(format!(" == {} ==   [{kind}]", q.name));
+        v.push(format!("   formula     {}", q.formula));
+        v.push(format!("   what        {}", q.what));
+        v.push(format!("   example     {}", q.example));
+        v.push(format!("   used for    {}", q.used));
+        if q.runnable() {
+            v.push("   in the app  F7 MATH FORECAST > STRATEGY list".into());
+        } else if matches!(q.run, crate::quant::Run::Sizing) {
+            v.push("   in the app  strategy window (TEST) > SIZE [VOL TARGET]".into());
+        }
+        v.push(String::new());
+    }
+    v
+}
+
 pub fn maths_lines(a: &App) -> Vec<String> {
     let mut v = vec![format!(" file: {}  (edit it to add entries; reopen tab to reload)", data_dir().join("maths.json").display()), String::new()];
     match &a.maths {
@@ -734,6 +1099,8 @@ pub fn maths_lines(a: &App) -> Vec<String> {
             }
         }
     }
+    v.push(String::new());
+    v.extend(library_lines());
     v
 }
 
@@ -748,13 +1115,109 @@ fn time_label(t: i64, tf: usize) -> String {
     chrono::DateTime::from_timestamp(t, 0).map_or(String::new(), |d| d.format(fmt).to_string())
 }
 
+fn quote_map(a: &App) -> HashMap<String, Quote> {
+    a.snap.quotes.iter().map(|q| (q.sym.clone(), q.clone())).collect()
+}
+
+/// A strategy's model prediction for a stock, at the strategy's own timeframe/horizon.
+fn pred_of<'a>(a: &'a App, s: &Strategy, m: &str, sym: &str) -> Option<&'a Prediction> {
+    a.snap.board.iter().find(|p| p.model == m && p.sym == sym && p.tf == s.tf && p.steps.len() == s.h)
+}
+
+fn signed(c: i64) -> String {
+    format!("{}{}", if c >= 0 { "+" } else { "" }, money(c))
+}
+
+/// "+$12.34 (+1.23%)" against `base` cents.
+fn pl(c: i64, base: i64) -> String {
+    format!("{} ({:+.2}%)", signed(c), c as f64 * 100.0 / base.max(1) as f64)
+}
+
+/// "45s", "12m", "3h 05m", "4d 06h"
+fn age(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        3600..86_400 => format!("{}h {:02}m", s / 3600, s / 60 % 60),
+        _ => format!("{}d {:02}h", s / 86_400, s / 3600 % 24),
+    }
+}
+
+/// CURRENT SHARES lines; Some(id) = clicking opens that strategy's window.
+/// Local date-time of a ms timestamp.
+fn when(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).map_or("?".into(), |d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+}
+
+/// F3 HISTORY: terminated runs, newest first, with their final results.
+pub fn history_lines(a: &App) -> Vec<(String, Option<Click>)> {
+    let q = quote_map(a);
+    let mut ss: Vec<&Strategy> = a.snap.strategies.iter().filter(|s| s.ended_ms > 0).collect();
+    if ss.is_empty() {
+        return vec![(" (no finished runs yet - TERMINATE a strategy in F2 CURRENT SHARES or its window)".into(), None)];
+    }
+    ss.sort_by_key(|s| -s.ended_ms);
+    let (tv, ts): (i64, i64) = ss.iter().map(|s| (paper::value(s, &q), s.start)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    let mut v = vec![(format!(" {} finished runs | total final value {} | total P/L {}", ss.len(), money(tv), pl(tv - ts, ts)), None), (String::new(), None)];
+    for s in ss {
+        let val = paper::value(s, &q);
+        let id = Some(Click::Strat(s.id));
+        let tf = s.tf.min(TIMEFRAMES.len() - 1);
+        let models: Vec<String> = s.models.iter().map(|m| short(m)).collect();
+        let buys = s.trades.iter().filter(|t| t.buy).count();
+        let peak = s.history.iter().map(|h| h.value).max().unwrap_or(s.start);
+        let low = s.history.iter().map(|h| h.value).min().unwrap_or(s.start);
+        v.push((format!(" {:<44} {:<11} {:<6} start {:>14}  final {:>14}  P/L {:>24}", s.name, s.kind, s.mode, money(s.start), money(val), pl(val - s.start, s.start)), id.clone()));
+        v.push((format!("   {} -> {} (ran {}) | models {} | {} x{} {}", when(s.created_ms), when(s.ended_ms), age(s.ended_ms - s.created_ms), models.join(" + "), TIMEFRAMES[tf].2, s.h, ahead(tf, s.h as u32)), id.clone()));
+        v.push((format!("   {} trades ({buys} buys, {} sells) | best value {} | worst value {}", s.trades.len(), s.trades.len() - buys, money(peak), money(low)), id));
+        v.push((format!("   [{}]", if a.armed(s.id) { "CLICK AGAIN TO DELETE FOREVER" } else { "DELETE THIS RUN" }), Some(Click::Del(s.id))));
+        v.push((String::new(), None));
+    }
+    v
+}
+
+pub fn shares_lines(a: &App) -> Vec<(String, Option<Click>)> {
+    let q = quote_map(a);
+    let ss: Vec<&Strategy> = a.snap.strategies.iter().filter(|s| s.ended_ms == 0).collect();
+    if ss.is_empty() {
+        return vec![(" (no running strategies - press TEST next to the chart in F6 AI FORECAST or F7 MATH FORECAST; finished runs are in F3 HISTORY)".into(), None)];
+    }
+    let (tv, ts): (i64, i64) = ss.iter().map(|s| (paper::value(s, &q), s.start)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    let mut v = vec![(format!(" {} strategies | total value {} | total P/L {}", ss.len(), money(tv), pl(tv - ts, ts)), None), (String::new(), None)];
+    let now = now_ms();
+    for s in ss {
+        let val = paper::value(s, &q);
+        let auto = match s.auto {
+            Auto::Off => "OFF",
+            Auto::TopPicks => "TOP PICKS",
+            Auto::Unusual => "UNUSUAL",
+            Auto::Signal => "SIGNAL",
+        };
+        let id = Some(Click::Strat(s.id));
+        v.push((format!(" {:<44} {:<8} {:<6} AUTO {:<10} value {:>14}  P/L {:>24}  cash {:>14}  {} stock(s)  running {}", s.name, s.kind, s.mode, auto, money(val), pl(val - s.start, s.start), money(s.cash), s.positions.len(), age(now - s.created_ms)), id.clone()));
+        let tf = s.tf.min(TIMEFRAMES.len() - 1);
+        let models: Vec<String> = s.models.iter().map(|m| short(m)).collect();
+        v.push((format!("   models {} | predictions {} x{} {} | {} trades{}", models.join(" + "), TIMEFRAMES[tf].2, s.h, ahead(tf, s.h as u32), s.trades.len(), if s.note.is_empty() { String::new() } else { format!(" | last: {}", s.note) }), id.clone()));
+        for p in &s.positions {
+            let c = q.get(&p.sym).map(paper::cents);
+            let mv = c.map_or(p.cost, |c| p.micro * c / SHARE);
+            let pn = s.models.first().and_then(|m| pred_of(a, s, m, &p.sym)).map_or("-".into(), |x| format!("{:+.2}% P(up) {:.0}%", x.exp_pct, x.p_up * 100.0));
+            v.push((format!("     {:<9}{:>12.4} sh  bought {:>13} @ {:>11}  now {:>11}  value {:>13}  P/L {:>24}  pred at buy {:+.2}% P(up) {:.0}%  now {pn}  held {}", p.sym, p.micro as f64 / SHARE as f64, money(p.cost), money(p.cost * SHARE / p.micro.max(1)), c.map_or("-".into(), money), money(mv), pl(mv - p.cost, p.cost), p.exp_pct, p.p_up * 100.0, age(now - p.opened_ms)), id.clone()));
+        }
+        v.push((format!("   [{}]", if a.armed(s.id) { "CLICK AGAIN TO TERMINATE (sells everything at market)" } else { "TERMINATE" }), Some(Click::End(s.id))));
+        v.push((String::new(), None));
+    }
+    v
+}
+
 fn name_of<'a>(a: &'a App, sym: &str) -> &'a str {
     a.snap.quotes.iter().find(|q| q.sym == sym).map_or("", |q| q.name.as_str())
 }
 
 /// Short model name for tight lines: "Kronos-base", "Black-Scholes Monte Carlo".
 fn short(id: &str) -> String {
-    AI_MODELS.iter().find(|m| m.0 == id).map_or(id, |m| m.1.split(" (").next().unwrap_or(m.1)).to_string()
+    model_label(id)
 }
 
 /// "Both right most" needs at least this many checked predictions per model per stock.
@@ -772,26 +1235,12 @@ pub struct Cmp<'a> {
     pub rho: Option<f64>,
 }
 
-/// Agreement = the WORSE of the two ranks (both must rate it high), ties by the sum of ranks.
+/// Rows in ai::agreement order, plus each model's leftovers; highlight picks.
 pub fn compare<'a>(pa: &[&'a Prediction], pb: &[&'a Prediction], ha: &[(&str, u32, u32)], hb: &[(&str, u32, u32)]) -> Cmp<'a> {
     let find = |v: &[&'a Prediction], s: &str| v.iter().find(|p| p.sym == s).copied();
-    let both: Vec<(&'a Prediction, &'a Prediction)> = pa.iter().filter_map(|x| find(pb, &x.sym).map(|y| (*x, y))).collect();
-    let rank = |side: fn(&(&'a Prediction, &'a Prediction)) -> f64| -> Vec<usize> {
-        let mut idx: Vec<usize> = (0..both.len()).collect();
-        idx.sort_by(|&i, &j| side(&both[j]).total_cmp(&side(&both[i])));
-        let mut r = vec![0; both.len()];
-        for (k, i) in idx.into_iter().enumerate() {
-            r[i] = k;
-        }
-        r
-    };
-    let (ra, rb) = (rank(|x| x.0.exp_pct), rank(|x| x.1.exp_pct));
-    let mut order: Vec<usize> = (0..both.len()).collect();
-    order.sort_by_key(|&i| (ra[i].max(rb[i]), ra[i] + rb[i]));
-    let n = both.len() as f64;
-    let rho = (both.len() >= 3).then(|| 1.0 - 6.0 * (0..both.len()).map(|i| (ra[i] as f64 - rb[i] as f64).powi(2)).sum::<f64>() / (n * (n * n - 1.0)));
-    let agree = order.iter().map(|&i| both[i]).filter(|(x, y)| x.exp_pct > 0.0 && y.exp_pct > 0.0 && x.p_up >= 0.5 && y.p_up >= 0.5).take(3).map(|x| x.0.sym.as_str()).collect();
-    let mut rows: Vec<(&'a str, Option<&'a Prediction>, Option<&'a Prediction>)> = order.iter().map(|&i| (both[i].0.sym.as_str(), Some(both[i].0), Some(both[i].1))).collect();
+    let (pairs, rho) = crate::ai::agreement(pa, pb);
+    let agree = pairs.iter().filter(|(x, y)| x.exp_pct > 0.0 && y.exp_pct > 0.0 && x.p_up >= 0.5 && y.p_up >= 0.5).take(3).map(|x| x.0.sym.as_str()).collect();
+    let mut rows: Vec<(&'a str, Option<&'a Prediction>, Option<&'a Prediction>)> = pairs.iter().map(|(x, y)| (x.sym.as_str(), Some(*x), Some(*y))).collect();
     rows.extend(pa.iter().filter(|x| find(pb, &x.sym).is_none()).map(|x| (x.sym.as_str(), Some(*x), None)));
     rows.extend(pb.iter().filter(|y| find(pa, &y.sym).is_none()).map(|y| (y.sym.as_str(), None, Some(*y))));
     let rate = |h: &[(&str, u32, u32)], s: &str| h.iter().find(|x| x.0 == s && x.2 >= MIN_CHECKED).map(|x| (x.1 as f64 / x.2 as f64, x.2));
@@ -819,17 +1268,28 @@ fn ahead(tf: usize, h: u32) -> String {
 
 /// PREDICTION OUTPUT panel: the forecast for the charted symbol and how unusual it is.
 fn prediction_lines(a: &App) -> Vec<String> {
-    let ai = &a.settings.ai;
-    let label = AI_MODELS.iter().find(|m| m.0 == ai.model).map_or("none picked", |m| m.1);
+    let ai = a.desk();
+    let label = if ai.model.is_empty() { "none picked".to_string() } else { model_label(&ai.model) };
+    let status = if a.math() { &a.snap.math_status } else { &a.snap.ai_status };
     let mut v = vec![
         format!(" model   {label} [{}]", model_status(&ai.model)),
-        format!(" status  {}", if ai.enabled { a.snap.ai_status.as_str() } else { "OFF" }),
+        format!(" status  {}", if ai.enabled { status.as_str() } else { "OFF" }),
     ];
+    if let Some(q) = crate::quant::find(&ai.model) {
+        v.push(format!(" rule    {}", q.formula));
+    }
     let off = a.snap.session.map_or(-18_000, |s| s.gmtoffset);
-    let Some(p) = a.snap.predictions.iter().find(|p| p.sym == a.snap.selected) else {
+    let Some(p) = a.single_pred() else {
         v.extend([String::new(), " (no prediction for this symbol yet)".into()]);
         return v;
     };
+    if !p.signal.is_empty() {
+        v.push(format!(" signal  {}", p.signal));
+    }
+    if p.samples == 0 {
+        v.extend([String::new(), format!(" no forecast for {} right now - the rule only forecasts on candles where it fires.", p.sym), " the LEADERBOARD shows which tracked stocks have a signal now.".into()]);
+        return v;
+    }
     let h = p.steps.len();
     let conf = ai.show_conf;
     v.push(format!(" input   {} {} | last {} candles | {} samples | made {} ET in {} ms", p.sym, TIMEFRAMES[p.tf].2, p.lookback, p.samples, hms(p.made_ms / 1000 + off), p.ms));
@@ -898,15 +1358,7 @@ fn hms(ts: i64) -> String {
 }
 
 fn money(cents: i64) -> String {
-    let d = (cents / 100).to_string();
-    let mut out = String::new();
-    for (i, ch) in d.chars().enumerate() {
-        if i > 0 && (d.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    format!("${out}.{:02}", cents % 100)
+    paper::fmt_cents(cents)
 }
 
 fn bytes(n: u64) -> String {
